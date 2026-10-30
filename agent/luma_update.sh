@@ -932,7 +932,7 @@ fi
 
 # Killing any running luma agents
 echo "Making sure no luma agent scripts are currently running..."
-ps aux | grep -ie luma_agent.sh | awk '{print $2}' | xargs -r kill -9
+ps aux | grep -ie luma_agent.sh | grep -v grep | awk '{print $2}' | xargs -r kill -9
 echo "... done."
 
 # Assign permissions

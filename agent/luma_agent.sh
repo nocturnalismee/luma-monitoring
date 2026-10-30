@@ -763,11 +763,7 @@ fi
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Starting LUMA Agent v$Version" >> "$ScriptPath"/debug.log; fi
 
 # Kill any lingering agent processes
-HTProcesses=$(pgrep -f luma_agent.sh | wc -l)
-if [ -z "$HTProcesses" ]
-then
-	HTProcesses=0
-fi
+HTProcesses=$(pgrep -f luma_agent.sh | wc -l | tr -d '[:space:]')
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Found $HTProcesses agent processes\n$(ps aux | grep 'luma_agent.sh')" >> "$ScriptPath"/debug.log; fi
 
 if [ "$HTProcesses" -ge 50 ]
@@ -2133,9 +2129,9 @@ if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CV: $CV" >> "
 OPING=""
 if [ -n "$OutgoingPings" ]
 then
-	OPING=$(grep -v '^$' "$ScriptPath"/ping.txt | tr -d '\n' | base64 | tr -d '\n\r\t ')
 	if [ -f "$ScriptPath"/ping.txt ]
 	then
+		OPING=$(grep -v '^$' "$ScriptPath"/ping.txt | tr -d '\n' | base64 | tr -d '\n\r\t ')
 		rm -f "$ScriptPath"/ping.txt
 	fi
 fi
