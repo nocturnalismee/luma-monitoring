@@ -35,7 +35,7 @@ github_wget() {
 }
 
 # Branch
-BRANCH="master"
+BRANCH="main"
 
 # Check if first argument is branch or SID
 if [ ${#1} -ne 32 ]
@@ -68,7 +68,7 @@ apply_agent_permissions() {
 }
 
 # Check if the selected branch exists
-if github_wget --spider -q https://raw.githubusercontent.com/luma-monitoring/agent/$BRANCH/luma_agent.sh
+if github_wget --spider -q https://raw.githubusercontent.com/nocturnalismee/luma-monitoring/$BRANCH/agent/luma_agent.sh
 then
 	echo "Installing from $BRANCH branch..."
 else
@@ -180,7 +180,7 @@ echo "... done."
 
 # Fetching the agent
 echo "Fetching the agent..."
-if ! github_wget -t 1 -T 30 -qO /etc/luma/luma_agent.sh https://raw.githubusercontent.com/luma-monitoring/agent/$BRANCH/luma_agent.sh
+if ! github_wget -t 1 -T 30 -qO /etc/luma/luma_agent.sh https://raw.githubusercontent.com/nocturnalismee/luma-monitoring/$BRANCH/agent/luma_agent.sh
 then
 	echo "ERROR: Failed to download the agent script from GitHub." >&2
 	exit 1
@@ -189,7 +189,7 @@ echo "... done."
 
 # Fetching the config file
 echo "Fetching the config file..."
-if ! github_wget -t 1 -T 30 -qO /etc/luma/luma.cfg https://raw.githubusercontent.com/luma-monitoring/agent/$BRANCH/luma.cfg
+if ! github_wget -t 1 -T 30 -qO /etc/luma/luma.cfg https://raw.githubusercontent.com/nocturnalismee/luma-monitoring/$BRANCH/agent/luma.cfg
 then
 	echo "ERROR: Failed to download the agent configuration from GitHub." >&2
 	exit 1
