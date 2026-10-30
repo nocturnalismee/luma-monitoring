@@ -1,0 +1,2193 @@
+#!/bin/bash
+#	LUMA - Lightweight Server Monitoring Agent
+#	Copyright 2015 - 2026
+#
+#
+#		DISCLAIMER OF WARRANTY
+#
+#	The Software is provided "AS IS" and "WITH ALL FAULTS," without warranty of any kind, 
+#	including without limitation the warranties of merchantability, fitness for a particular purpose and non-infringement. 
+#	LUMA makes no warranty that the Software is free of defects or is suitable for any particular purpose. 
+#	In no event shall LUMA be responsible for loss or damages arising from the installation or use of the Software, 
+#	including but not limited to any indirect, punitive, special, incidental or consequential damages of any character including, 
+#	without limitation, damages for loss of goodwill, work stoppage, computer failure or malfunction, or any and all other commercial damages or losses. 
+#	The entire risk as to the quality and performance of the Software is borne by you, the user.
+#
+#		END OF DISCLAIMER OF WARRANTY
+
+# Set PATH/Locale
+export LC_NUMERIC="C"
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ScriptPath=$(dirname "${BASH_SOURCE[0]}")
+
+# Agent Version (do not change)
+Version="2.4.2"
+
+# Default configuration values
+SID=""
+NetworkInterfaces=""
+IgnoredDisks="tmpfs|aufs|squashfs|container_tmp"
+CheckServices=""
+CheckSoftRAID=0
+CheckDriveHealth=0
+CheckReboot=1
+RunningProcesses=0
+ConnectionPorts=""
+CustomVars="custom_variables.json"
+SecuredConnection=1
+CollectEveryXSeconds=3
+DEBUG=0
+OutgoingPings=""
+OutgoingPingsCount=20
+
+strip_config_comment() {
+	local input=$1
+	local output=""
+	local char previous_char=""
+	local in_single=0
+	local in_double=0
+	local i
+
+	for ((i = 0; i < ${#input}; i++))
+	do
+		char=${input:i:1}
+		if [ "$char" = "'" ] && [ "$in_double" -eq 0 ]
+		then
+			if [ "$in_single" -eq 1 ]
+			then
+				in_single=0
+			else
+				in_single=1
+			fi
+		elif [ "$char" = '"' ] && [ "$in_single" -eq 0 ]
+		then
+			if [ "$in_double" -eq 1 ]
+			then
+				in_double=0
+			else
+				in_double=1
+			fi
+		elif [ "$char" = "#" ] && [ "$in_single" -eq 0 ] && [ "$in_double" -eq 0 ]
+		then
+			if [ -z "$previous_char" ] || [[ "$previous_char" =~ [[:space:]] ]]
+			then
+				break
+			fi
+		fi
+		output="$output$char"
+		previous_char=$char
+	done
+
+	printf '%s' "$output"
+}
+
+trim_config_value() {
+	local value=$1
+
+	value="${value#"${value%%[!$' \t\r\n']*}"}"
+	value="${value%"${value##*[!$' \t\r\n']}"}"
+	printf '%s' "$value"
+}
+
+normalize_binary_setting() {
+	local value=$1
+	local default_value=$2
+
+	value=$(printf '%s' "$value" | tr -d '[:space:]')
+	if ! [[ "$value" =~ ^[01]$ ]]
+	then
+		value=$default_value
+	fi
+
+	printf '%s' "$value"
+}
+
+normalize_connection_ports() {
+	local raw_ports=$1
+	local normalized_ports=""
+	local port
+	local port_number
+	local ports_array
+
+	IFS=',' read -r -a ports_array <<< "$raw_ports"
+	for port in "${ports_array[@]}"
+	do
+		port=$(trim_config_value "$port")
+		if [[ "$port" =~ ^[0-9]{1,5}$ ]]
+		then
+			port_number=$((10#$port))
+			if [ "$port_number" -ge 1 ] && [ "$port_number" -le 65535 ]
+			then
+				if [ -n "$normalized_ports" ]
+				then
+					normalized_ports="$normalized_ports,"
+				fi
+				normalized_ports="$normalized_ports$port_number"
+			fi
+		fi
+	done
+
+	printf '%s' "$normalized_ports"
+}
+
+normalize_service_names() {
+	local raw_services=$1
+	local normalized_services=""
+	local service_name
+	local services_array
+
+	IFS=',' read -r -a services_array <<< "$raw_services"
+	for service_name in "${services_array[@]}"
+	do
+		service_name=$(trim_config_value "$service_name")
+		if [[ "$service_name" =~ ^[A-Za-z0-9_.@:+-]+$ ]]
+		then
+			if [ -n "$normalized_services" ]
+			then
+				normalized_services="$normalized_services,"
+			fi
+			normalized_services="$normalized_services$service_name"
+		fi
+	done
+
+	printf '%s' "$normalized_services"
+}
+
+load_config() {
+	local config_file=$1
+	local line key value value_length first_char last_char
+
+	if [ ! -f "$config_file" ]
+	then
+		return 1
+	fi
+
+	while IFS= read -r line || [ -n "$line" ]
+	do
+		line=${line%$'\r'}
+		case "$line" in
+			''|\#*)
+				continue
+				;;
+				*=*)
+					key=${line%%=*}
+					value=${line#*=}
+					key=$(trim_config_value "$key")
+					value=$(strip_config_comment "$value")
+					value=$(trim_config_value "$value")
+					value_length=${#value}
+				first_char=${value:0:1}
+				last_char=""
+				if [ "$value_length" -gt 0 ]
+				then
+					last_char=${value:$((value_length - 1)):1}
+				fi
+				if [ "$value_length" -ge 2 ] && { { [ "$first_char" = '"' ] && [ "$last_char" = '"' ]; } || { [ "$first_char" = "'" ] && [ "$last_char" = "'" ]; }; }
+				then
+					value=${value:1:$((value_length - 2))}
+				fi
+				case "$key" in
+					SID|NetworkInterfaces|IgnoredDisks|CheckServices|CheckSoftRAID|CheckDriveHealth|CheckReboot|RunningProcesses|ConnectionPorts|CustomVars|SecuredConnection|CollectEveryXSeconds|DEBUG|OutgoingPings|OutgoingPingsCount)
+						printf -v "$key" '%s' "$value"
+						;;
+				esac
+				;;
+		esac
+	done < "$config_file"
+}
+
+# Load configuration file
+if ! load_config "$ScriptPath"/luma.cfg
+then
+	exit 1
+fi
+DisksIgnoreFilter="$IgnoredDisks"
+CheckReboot=$(normalize_binary_setting "$CheckReboot" 1)
+CheckSoftRAID=$(normalize_binary_setting "$CheckSoftRAID" 0)
+CheckDriveHealth=$(normalize_binary_setting "$CheckDriveHealth" 0)
+RunningProcesses=$(normalize_binary_setting "$RunningProcesses" 0)
+DEBUG=$(normalize_binary_setting "$DEBUG" 0)
+CollectEveryXSeconds=$(printf '%s' "$CollectEveryXSeconds" | tr -d '[:space:]')
+if ! [[ "$CollectEveryXSeconds" =~ ^[0-9]{1,2}$ ]] || [ "$CollectEveryXSeconds" -lt 1 ] || [ "$CollectEveryXSeconds" -gt 60 ]
+then
+	CollectEveryXSeconds=3
+fi
+SecuredConnection=$(normalize_binary_setting "$SecuredConnection" 1)
+CheckServices=$(normalize_service_names "$CheckServices")
+ConnectionPorts=$(normalize_connection_ports "$ConnectionPorts")
+
+function filterignoreddisks() {
+	if [ -n "$DisksIgnoreFilter" ]
+	then
+		grep -v -E -- "$DisksIgnoreFilter"
+	else
+		cat
+	fi
+}
+
+# Script start time
+ScriptStartTime=$(date +[%Y-%m-%d\ %T)
+
+function validextendedregex() {
+	printf '' | grep -E -- "$1" > /dev/null 2>&1
+	local GrepExitCode=$?
+	[ "$GrepExitCode" -ne 2 ]
+}
+
+if [ -n "$DisksIgnoreFilter" ] && ! validextendedregex "$DisksIgnoreFilter"
+then
+	if [ "$DEBUG" -eq 1 ]
+	then
+		echo -e "$ScriptStartTime-$(date +%T]) WARNING: IgnoredDisks contains an invalid regex ($DisksIgnoreFilter), disk filtering disabled" >> "$ScriptPath"/debug.log
+	fi
+	DisksIgnoreFilter=""
+fi
+
+function regexescape() {
+	printf '%s' "$1" | sed -e 's/[][(){}.^$*+?|\\]/\\&/g'
+}
+
+function serviceprocessrunning() {
+	local service_regex
+	service_regex=$(regexescape "$1")
+
+	if command -v "pgrep" > /dev/null 2>&1
+	then
+		pgrep -x "$1" > /dev/null 2>&1 || pgrep -f "(^|\/)${service_regex}([[:space:]]|$)" > /dev/null 2>&1
+	else
+		(( $(ps -eo args= | grep -E "(^|/)${service_regex}([[:space:]]|$)" | grep -v "grep" | wc -l) > 0 ))
+	fi
+}
+
+function rpmdbhassqlitebackend() {
+	[ -f /var/lib/rpm/rpmdb.sqlite ] || [ -f /usr/lib/sysimage/rpm/rpmdb.sqlite ]
+}
+
+function filemtime() {
+	stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+function writerebootcheckcache() {
+	{ printf '%s %s\n' "$1" "$2" > "$3"; } 2>/dev/null
+}
+
+function debugrebootcheckcache() {
+	local CacheFile=$1
+	local CacheDir=""
+	local CacheDirState=""
+	local CacheState=""
+	local CacheContent=""
+
+	if [ "$DEBUG" -ne 1 ]
+	then
+		return 0
+	fi
+
+	CacheDir=${CacheFile%/*}
+	[ "$CacheDir" = "$CacheFile" ] && CacheDir="."
+	CacheDirState=$(ls -ld "$CacheDir" 2>/dev/null)
+
+	if [ -e "$CacheFile" ]
+	then
+		CacheState=$(ls -ld "$CacheFile" 2>/dev/null)
+		CacheContent=$(cat "$CacheFile" 2>/dev/null) || CacheContent="[unreadable]"
+		echo -e "$ScriptStartTime-$(date +%T]) Reboot check cache file: $CacheFile directory: $CacheDirState state: $CacheState content: $CacheContent" >> "$ScriptPath"/debug.log
+	else
+		echo -e "$ScriptStartTime-$(date +%T]) Reboot check cache file: $CacheFile directory: $CacheDirState state: missing" >> "$ScriptPath"/debug.log
+	fi
+}
+
+function rpmpackagetoolrunning() {
+	if command -v "pgrep" > /dev/null 2>&1
+	then
+		pgrep -x rpm > /dev/null 2>&1 ||
+		pgrep -x dnf > /dev/null 2>&1 ||
+		pgrep -x dnf-3 > /dev/null 2>&1 ||
+		pgrep -x dnf5 > /dev/null 2>&1 ||
+		pgrep -x yum > /dev/null 2>&1 ||
+		pgrep -x microdnf > /dev/null 2>&1 ||
+		pgrep -x rpm-ostree > /dev/null 2>&1 ||
+		pgrep -x dnf-automatic > /dev/null 2>&1 ||
+		pgrep -x yum-cron > /dev/null 2>&1 ||
+		pgrep -x packagekitd > /dev/null 2>&1 ||
+		pgrep -f '(^|[[:space:]/])needs-restarting([[:space:]]|$)' > /dev/null 2>&1
+	else
+		ps -eo comm= 2>/dev/null | grep -Eq '^(rpm|dnf|dnf-3|dnf5|yum|microdnf|rpm-ostree|dnf-automatic|yum-cron|packagekitd)$' ||
+		ps -eo args= 2>/dev/null | grep -E '(^|[[:space:]/])needs-restarting([[:space:]]|$)' | grep -v grep > /dev/null 2>&1
+	fi
+}
+
+function timeoutsupportskillafter() {
+	command -v "timeout" > /dev/null 2>&1 && timeout --help 2>&1 | grep -q -- '-k'
+}
+
+function needsrestartingwithtimeout() {
+	local OutputFile=""
+	local CmdPID=""
+	local TimeoutPID=""
+	local ExitCode=0
+
+	if timeoutsupportskillafter
+	then
+		LC_ALL=C timeout -s TERM -k 15s 15s needs-restarting -r
+		return $?
+	fi
+
+	OutputFile=$(mktemp "${TMPDIR:-/tmp}/luma_needs_restarting.XXXXXX" 2>/dev/null)
+	if [ -z "$OutputFile" ]
+	then
+		return 125
+	fi
+
+	LC_ALL=C needs-restarting -r > "$OutputFile" 2>&1 &
+	CmdPID=$!
+
+	(
+		sleep 15
+		kill -TERM "$CmdPID" > /dev/null 2>&1
+		sleep 15
+		kill -KILL "$CmdPID" > /dev/null 2>&1
+	) &
+	TimeoutPID=$!
+
+	wait "$CmdPID" > /dev/null 2>&1
+	ExitCode=$?
+	kill "$TimeoutPID" > /dev/null 2>&1
+	wait "$TimeoutPID" > /dev/null 2>&1
+
+	cat "$OutputFile"
+	rm -f "$OutputFile"
+	return "$ExitCode"
+}
+
+# Service status function
+function servicestatus() {
+	if command -v "systemctl" > /dev/null 2>&1
+	then
+		if systemctl is-active --quiet "$1"
+		then
+			echo "1"
+			return 0
+		fi
+	fi
+	if command -v "service" > /dev/null 2>&1
+	then
+		if service "$1" status > /dev/null 2>&1
+		then
+			echo "1"
+			return 0
+		fi
+	fi
+	if serviceprocessrunning "$1"
+	then
+		echo "1"
+	else
+		echo "0"
+	fi
+}
+
+# Function used to prepare base64 str for url encoding
+function base64prep() {
+	str=$1
+	str="${str//+/%2B}"
+	str="${str//\//%2F}"
+	echo "$str"
+}
+
+function customvarspath() {
+	local custom_vars=$1
+	local base_dir custom_vars_path real_dir real_file
+
+	case "$custom_vars" in
+		''|/*)
+			return 1
+			;;
+	esac
+
+	base_dir=$(cd -P -- "$ScriptPath" 2>/dev/null && pwd) || return 1
+	custom_vars_path="$base_dir/$custom_vars"
+
+	if [ -L "$custom_vars_path" ] || [ ! -f "$custom_vars_path" ]
+	then
+		return 1
+	fi
+
+	real_dir=$(cd -P -- "$(dirname -- "$custom_vars_path")" 2>/dev/null && pwd) || return 1
+	real_file="$real_dir/$(basename -- "$custom_vars_path")"
+	case "$real_file" in
+		"$base_dir"/*)
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	printf '%s\n' "$real_file"
+}
+
+function timems() {
+	local TimeNow
+	TimeNow=$(date +%s%3N 2>/dev/null)
+	if [[ "$TimeNow" =~ ^[0-9]+$ ]]
+	then
+		echo "$TimeNow"
+	else
+		echo "$(( $(date +%s) * 1000 ))"
+	fi
+}
+
+function runwithtimeout() {
+	local TimeoutSeconds=$1
+	local CaptureOutput=0
+	local OutputFile=""
+	local ExitCode=0
+	shift
+	RUNWITHTIMEOUT_LAST_OUTPUT=""
+	if [ "$DEBUG" -eq 1 ]
+	then
+		CaptureOutput=1
+		OutputFile=$(mktemp "${TMPDIR:-/tmp}/luma_tcp_probe.XXXXXX" 2>/dev/null)
+		if [ -z "$OutputFile" ]
+		then
+			CaptureOutput=0
+		fi
+	fi
+	if command -v "timeout" > /dev/null 2>&1
+	then
+		if [ "$CaptureOutput" -eq 1 ]
+		then
+			timeout -s 9 "$TimeoutSeconds" "$@" > "$OutputFile" 2>&1
+		else
+			timeout -s 9 "$TimeoutSeconds" "$@" > /dev/null 2>&1
+		fi
+		ExitCode=$?
+	else
+		if [ "$CaptureOutput" -eq 1 ]
+		then
+			"$@" > "$OutputFile" 2>&1 &
+		else
+			"$@" > /dev/null 2>&1 &
+		fi
+		local CmdPID=$!
+		local WaitTicks=0
+		local MaxTicks=$(( TimeoutSeconds * 10 ))
+		while kill -0 "$CmdPID" > /dev/null 2>&1
+		do
+			if [ "$WaitTicks" -ge "$MaxTicks" ]
+			then
+				kill -9 "$CmdPID" > /dev/null 2>&1
+				wait "$CmdPID" > /dev/null 2>&1
+				ExitCode=124
+				break
+			fi
+			sleep 0.1
+			WaitTicks=$(( WaitTicks + 1 ))
+		done
+		if [ "$ExitCode" -ne 124 ]
+		then
+			wait "$CmdPID" > /dev/null 2>&1
+			ExitCode=$?
+		fi
+	fi
+	if [ "$CaptureOutput" -eq 1 ] && [ -f "$OutputFile" ]
+	then
+		RUNWITHTIMEOUT_LAST_OUTPUT=$(cat "$OutputFile")
+		rm -f "$OutputFile"
+	fi
+	return $ExitCode
+}
+
+function ncprobeavailable() {
+	if ! command -v "nc" > /dev/null 2>&1
+	then
+		return 1
+	fi
+	local NCHelp
+	NCHelp=$(nc -h 2>&1)
+	if [ -z "$NCHelp" ]
+	then
+		NCHelp=$(nc --help 2>&1)
+	fi
+	if echo "$NCHelp" | grep -q -- '-z' && echo "$NCHelp" | grep -q -- '-w'
+	then
+		return 0
+	fi
+	return 1
+}
+
+function devtcpprobeavailable() {
+	local DevTCPTest
+	DevTCPTest=$(bash -c 'exec 3<>/dev/tcp/127.0.0.1/1' 2>&1 || true)
+	if [[ "$DevTCPTest" == *"No such file or directory"* ]]
+	then
+		return 1
+	fi
+	return 0
+}
+
+function gettcpprobemethod() {
+	if [ -n "$TCPProbeMethod" ]
+	then
+		echo "$TCPProbeMethod"
+		return 0
+	fi
+	if ncprobeavailable
+	then
+		TCPProbeMethod="nc"
+	elif devtcpprobeavailable
+	then
+		TCPProbeMethod="devtcp"
+	elif command -v "telnet" > /dev/null 2>&1
+	then
+		TCPProbeMethod="telnet"
+	else
+		TCPProbeMethod="none"
+	fi
+	echo "$TCPProbeMethod"
+}
+
+function tcpsamplecount() {
+	local SampleCount=$(( (OutgoingPingsCount + 4) / 5 ))
+	if [ "$SampleCount" -lt 2 ]
+	then
+		SampleCount=2
+	fi
+	if [ "$SampleCount" -gt 8 ]
+	then
+		SampleCount=8
+	fi
+	echo "$SampleCount"
+}
+
+function tcpportprobe() {
+	local PingTarget=$1
+	local PingPort=$2
+	local ProbeTimeout=3
+	local ProbeMethod
+	ProbeMethod=$(gettcpprobemethod)
+	if [ "$ProbeMethod" == "nc" ]
+	then
+		TCPProbeLastCommand="nc -z -w $ProbeTimeout $PingTarget $PingPort"
+		runwithtimeout "$ProbeTimeout" nc -z -w "$ProbeTimeout" "$PingTarget" "$PingPort"
+		return $?
+	fi
+	if [ "$ProbeMethod" == "devtcp" ]
+	then
+		TCPProbeLastCommand="bash -c exec 3<>/dev/tcp/$PingTarget/$PingPort"
+		runwithtimeout "$ProbeTimeout" bash -c "exec 3<>/dev/tcp/$PingTarget/$PingPort"
+		return $?
+	fi
+	if [ "$ProbeMethod" == "telnet" ]
+	then
+		TCPProbeLastCommand="bash -c printf 'quit\\n' | telnet $PingTarget $PingPort"
+		runwithtimeout "$ProbeTimeout" bash -c "printf 'quit\n' | telnet $PingTarget $PingPort"
+		return $?
+	fi
+	TCPProbeLastCommand=""
+	return 1
+}
+
+function icmppingstatus() {
+	local TargetName=$1
+	local PingTarget=$2
+	local PING_OUTPUT
+	local PACKET_LOSS
+	local RTT_LINE
+	local AVG_RTT
+	PING_OUTPUT=$(ping "$PingTarget" -c "$OutgoingPingsCount" 2>/dev/null)
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T])PING_OUTPUT:\n$PING_OUTPUT" >> "$ScriptPath"/debug.log; fi
+	PACKET_LOSS=$(echo "$PING_OUTPUT" | grep -o '[0-9]\+% packet loss' | cut -d'%' -f1)
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T])PACKET_LOSS: $PACKET_LOSS" >> "$ScriptPath"/debug.log; fi
+	if [ -z "$PACKET_LOSS" ]
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to extract packet loss" >> "$ScriptPath"/debug.log; fi
+		exit 1
+	fi
+	RTT_LINE=$(echo "$PING_OUTPUT" | grep 'rtt min/avg/max/mdev')
+	if [ -n "$RTT_LINE" ]
+	then
+		AVG_RTT=$(echo "$RTT_LINE" | awk -F'/' '{print $5}')
+		AVG_RTT=$(echo | awk "{print $AVG_RTT * 1000}" | awk '{printf "%18.0f",$1}' | xargs)
+	else
+		AVG_RTT="0"
+	fi
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T])AVG_RTT: $AVG_RTT" >> "$ScriptPath"/debug.log; fi
+	echo "$TargetName,$PingTarget,$PACKET_LOSS,$AVG_RTT;" >> "$ScriptPath"/ping.txt
+}
+
+function tcppingstatus() {
+	local TargetName=$1
+	local PingTarget=$2
+	local PingPort=$3
+	local OutputTarget="${PingTarget}_${PingPort}"
+	local ProbeMethod
+	local SampleCount
+	local SampleIndex=1
+	local SuccessCount=0
+	local FailCount=0
+	local RTTSum=0
+	local ProbeStart
+	local ProbeEnd
+	local ProbeRTT
+	local ProbeExitCode
+	local ProbeOutput
+	local PACKET_LOSS
+	local AVG_RTT
+	ProbeMethod=$(gettcpprobemethod)
+	if [ "$ProbeMethod" == "none" ]
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) No TCP probing method available for $PingTarget:$PingPort" >> "$ScriptPath"/debug.log; fi
+		exit 1
+	fi
+	SampleCount=$(tcpsamplecount)
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) TCP probing $PingTarget:$PingPort via $ProbeMethod using $SampleCount samples 5 seconds apart" >> "$ScriptPath"/debug.log; fi
+	while [ "$SampleIndex" -le "$SampleCount" ]
+	do
+		ProbeStart=$(timems)
+		tcpportprobe "$PingTarget" "$PingPort"
+		ProbeExitCode=$?
+		ProbeOutput=$RUNWITHTIMEOUT_LAST_OUTPUT
+		if [ "$DEBUG" -eq 1 ]
+		then
+			if [ -n "$ProbeOutput" ]
+			then
+				echo -e "$ScriptStartTime-$(date +%T]) TCP sample $SampleIndex/$SampleCount raw output via $ProbeMethod ($TCPProbeLastCommand):\n$ProbeOutput" >> "$ScriptPath"/debug.log
+			else
+				echo -e "$ScriptStartTime-$(date +%T]) TCP sample $SampleIndex/$SampleCount raw output via $ProbeMethod ($TCPProbeLastCommand): <empty>" >> "$ScriptPath"/debug.log
+			fi
+		fi
+		if [ "$ProbeExitCode" -eq 0 ]
+		then
+			ProbeEnd=$(timems)
+			ProbeRTT=$(( ProbeEnd - ProbeStart ))
+			if [ "$ProbeRTT" -lt 0 ]
+			then
+				ProbeRTT=0
+			fi
+			RTTSum=$(( RTTSum + ProbeRTT ))
+			SuccessCount=$(( SuccessCount + 1 ))
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) TCP sample $SampleIndex/$SampleCount success for $PingTarget:$PingPort RTT ${ProbeRTT}ms exit code $ProbeExitCode" >> "$ScriptPath"/debug.log; fi
+		else
+			FailCount=$(( FailCount + 1 ))
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) TCP sample $SampleIndex/$SampleCount failed for $PingTarget:$PingPort exit code $ProbeExitCode" >> "$ScriptPath"/debug.log; fi
+		fi
+		if [ "$SampleIndex" -lt "$SampleCount" ]
+		then
+			sleep 5
+		fi
+		SampleIndex=$(( SampleIndex + 1 ))
+	done
+	PACKET_LOSS=$(awk -v fail="$FailCount" -v total="$SampleCount" 'BEGIN { printf "%18.0f", (fail * 100) / total }' | xargs)
+	if [ "$SuccessCount" -gt 0 ]
+	then
+		AVG_RTT=$(awk -v sum="$RTTSum" -v success="$SuccessCount" 'BEGIN { printf "%18.0f", sum / success }' | xargs)
+	else
+		AVG_RTT="0"
+	fi
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) TCP packet loss: $PACKET_LOSS AVG_RTT: $AVG_RTT" >> "$ScriptPath"/debug.log; fi
+	echo "$TargetName,$OutputTarget,$PACKET_LOSS,$AVG_RTT;" >> "$ScriptPath"/ping.txt
+}
+
+# Function used to perform outgoing PING tests
+function pingstatus() {
+	local TargetName=$1
+	local PingTarget=$2
+	local PingPort=$3
+	if ! [[ "$TargetName" =~ ^[A-Za-z0-9._-]+$ ]]
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid PING target name value" >> "$ScriptPath"/debug.log; fi
+		exit 1
+	fi
+	if ! [[ "$PingTarget" =~ ^[A-Za-z0-9.:_-]+$ ]]
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid PING target value" >> "$ScriptPath"/debug.log; fi
+		exit 1
+	fi
+	if [ -n "$PingPort" ] && ( ! [[ "$PingPort" =~ ^[0-9]+$ ]] || (( PingPort < 1 || PingPort > 65535 )) )
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid PING port value" >> "$ScriptPath"/debug.log; fi
+		exit 1
+	fi
+	if ! [[ "$OutgoingPingsCount" =~ ^[0-9]+$ ]] || (( OutgoingPingsCount < 10 || OutgoingPingsCount > 40 ))
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid PING count value" >> "$ScriptPath"/debug.log; fi
+		exit 1
+	fi
+	if [ -n "$PingPort" ]
+	then
+		tcppingstatus "$TargetName" "$PingTarget" "$PingPort"
+	else
+		icmppingstatus "$TargetName" "$PingTarget"
+	fi
+}
+
+# Check if the agent needs to run Outgoing PING tests
+if [ "$1" == "ping" ]
+then
+	if [ -n "$4" ]
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Starting TCP PING: $2 ($3:$4) sampled from OutgoingPingsCount=$OutgoingPingsCount" >> "$ScriptPath"/debug.log; fi
+	else
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Starting PING: $2 ($3) $OutgoingPingsCount times" >> "$ScriptPath"/debug.log; fi
+	fi
+	pingstatus "$2" "$3" "$4"
+	exit 1
+fi
+
+# Clear debug.log every day at midnight
+if [ -z "$(date +%H | sed 's/^0*//')" ] && [ -z "$(date +%M | sed 's/^0*//')" ] && [ -f "$ScriptPath"/debug.log ]
+then
+	rm -f "$ScriptPath"/debug.log
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Cleared debug.log" >> "$ScriptPath"/debug.log; fi
+fi
+
+# Start timers
+START=$(date +%s)
+tTIMEDIFF=0
+
+# Get current minute
+M=$(date +%M | sed 's/^0*//')
+if [ -z "$M" ]
+then
+	# If minute is empty, set it to 0
+	M=0
+
+	# Clear luma_cron.log every hour
+	if [ -f "$ScriptPath"/luma_cron.log ]
+	then
+		rm -f "$ScriptPath"/luma_cron.log
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Cleared luma_cron.log" >> "$ScriptPath"/debug.log; fi
+	fi
+fi
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Starting LUMA Agent v$Version" >> "$ScriptPath"/debug.log; fi
+
+# Kill any lingering agent processes
+HTProcesses=$(pgrep -f luma_agent.sh | wc -l)
+if [ -z "$HTProcesses" ]
+then
+	HTProcesses=0
+fi
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Found $HTProcesses agent processes\n$(ps aux | grep 'luma_agent.sh')" >> "$ScriptPath"/debug.log; fi
+
+if [ "$HTProcesses" -ge 50 ]
+then
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Killing $HTProcesses lingering agent processes" >> "$ScriptPath"/debug.log; fi
+	pgrep -f luma_agent.sh | xargs -r kill -9
+fi
+if [ "$HTProcesses" -ge 10 ]
+then
+	for PID in $(pgrep -f luma_agent.sh)
+	do
+		PID_TIME=$(ps -p "$PID" -oetime= | tr '-' ':' | awk -F: '{total=0; m=1;} {for (i=0; i < NF; i++) {total += $(NF-i)*m; m *= i >= 2 ? 24 : 60 }} {print total}')
+		if [ -n "$PID_TIME" ] && [ "$PID_TIME" -ge 90 ]
+		then
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Killing PID $PID, running for $PID_TIME seconds" >> "$ScriptPath"/debug.log; fi
+			kill -9 "$PID"
+		fi
+	done
+fi
+
+# Outgoing PING
+if [ -n "$OutgoingPings" ]
+then
+	IFS='|' read -r -a OutgoingPingsArray <<< "$OutgoingPings"
+	for i in "${OutgoingPingsArray[@]}"
+	do
+		IFS=',' read -r -a OutgoingPing <<< "$i"
+		if [ "${#OutgoingPing[@]}" -eq 2 ] || [ "${#OutgoingPing[@]}" -eq 3 ]
+		then
+			bash "$ScriptPath"/luma_agent.sh ping "${OutgoingPing[0]}" "${OutgoingPing[1]}" "${OutgoingPing[2]}" &
+		else
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Invalid OutgoingPings entry: $i" >> "$ScriptPath"/debug.log; fi
+		fi
+	done
+fi
+
+# Network interfaces
+if [ -n "$NetworkInterfaces" ]
+then
+	# Use the network interfaces specified in Settings
+	IFS=',' read -r -a NetworkInterfacesArray <<< "$NetworkInterfaces"
+else
+	# Automatically detect the network interfaces
+	NetworkInterfacesArray=()
+	while IFS='' read -r line; do NetworkInterfacesArray+=("$line"); done < <(ip a | grep BROADCAST | grep 'state UP' | grep -v 'SLAVE' | awk '{print $2}' | awk -F ":" '{print $1}' | awk -F "@" '{print $1}')
+fi
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interfaces: ${NetworkInterfacesArray[*]}" >> "$ScriptPath"/debug.log; fi
+
+# Initial network usage
+T=$(cat /proc/net/dev)
+declare -A aRX
+declare -A aTX
+declare -A tRX
+declare -A tTX
+
+# Loop through network interfaces
+for NIC in "${NetworkInterfacesArray[@]}"
+do
+	aRX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $2}')
+	aTX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $10}')
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interface $NIC RX: ${aRX[$NIC]} TX: ${aTX[$NIC]}" >> "$ScriptPath"/debug.log; fi
+done
+
+AutoDetectedPorts=()
+if [ -z "${ConnectionPorts// }" ]
+then
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Detecting external connection ports" >> "$ScriptPath"/debug.log; fi
+	if command -v "ss" > /dev/null 2>&1
+	then
+		mapfile -t AutoDetectedPorts < <(ss -Htnl 2>/dev/null | awk '{print $4}' | grep -E ':[0-9]+$' | grep -Ev '^(127\.|::1|\[::1\])' | grep -Ev '\[?fe80:' | sed -E 's/.*:([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -n | uniq)
+	elif command -v "netstat" > /dev/null 2>&1
+	then
+		mapfile -t AutoDetectedPorts < <(netstat -tnl 2>/dev/null | awk 'NR>2 {print $4}' | grep -E ':[0-9]+$' | grep -Ev '^(127\.|::1|\[::1\])' | grep -Ev '\[?fe80:' | sed -E 's/.*:([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -n | uniq)
+	fi
+	if [ ${#AutoDetectedPorts[@]} -gt 30 ]
+	then
+		AutoDetectedPorts=("${AutoDetectedPorts[@]:0:30}")
+	fi
+	if [ ${#AutoDetectedPorts[@]} -gt 0 ]
+	then
+		ConnectionPorts=$(IFS=','; printf '%s' "${AutoDetectedPorts[*]}")
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Auto detected connection ports: ${AutoDetectedPorts[*]}" >> "$ScriptPath"/debug.log; fi
+	else
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) No external connection ports detected" >> "$ScriptPath"/debug.log; fi
+	fi
+fi
+
+# Port connections
+if [ -n "$ConnectionPorts" ]
+then
+	IFS=',' read -r -a ConnectionPortsArray <<< "$ConnectionPorts"
+	declare -A Connections
+	if command -v "ss" > /dev/null 2>&1
+	then
+		ConnectionPeers=$(ss -ntu | awk '{print $5}')
+	elif command -v "netstat" > /dev/null 2>&1
+	then
+		ConnectionPeers=$(netstat -ntu | grep "ESTABLISHED" 2>/dev/null | awk 'NR>2 {print $4}')
+	else
+		ConnectionPeers=""
+	fi
+	for cPort in "${ConnectionPortsArray[@]}"
+	do
+		Connections["$cPort"]=$(echo "$ConnectionPeers" | grep -c ":$cPort$")
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port $cPort Connections: ${Connections["$cPort"]}" >> "$ScriptPath"/debug.log; fi
+	done
+fi
+
+# Temperature
+declare -A TempArray
+declare -A TempArrayCnt
+SensorsCmdDisable=0
+
+# Check Services
+if [ -n "$CheckServices" ]
+then
+	declare -A SRVCSR
+	IFS=',' read -r -a CheckServicesArray <<< "$CheckServices"
+	for i in "${CheckServicesArray[@]}"
+	do
+		ServiceStatus=$(servicestatus "$i")
+		SRVCSR["$i"]=$(( ${SRVCSR["$i"]:-0} + ServiceStatus ))
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Service $i status: ${SRVCSR["$i"]}" >> "$ScriptPath"/debug.log; fi
+	done
+fi
+
+# Disks IOPS
+declare -A vDISKs
+df_mount_output=$(timeout 3 df 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$df_mount_output" ]
+then
+	df_mount_output=$(timeout 3 df -l 2>/dev/null)
+fi
+for i in $(echo "$df_mount_output" | filterignoreddisks | awk '$1 ~ /\// {print $(NF)}')
+do
+	vDISKs[$i]=$(lsblk -l | grep -w "$i" | awk '{print $1}')
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Disk $i: ${vDISKs[$i]}" >> "$ScriptPath"/debug.log; fi
+done
+declare -A IOPSRead
+declare -A IOPSWrite
+diskstats=$(cat /proc/diskstats)
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) /proc/diskstats:\n$diskstats" >> "$ScriptPath"/debug.log; fi
+lsblk_mnt_option="MOUNTPOINTS"
+if ! lsblk -l -o NAME,MOUNTPOINTS >/dev/null 2>&1; then
+	lsblk_mnt_option="MOUNTPOINT"
+fi
+DiskstatsSectorSize=512
+for i in "${!vDISKs[@]}"
+do
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) IOPS Disk $i: ${vDISKs[$i]}" >> "$ScriptPath"/debug.log; fi
+	IOPSRead[$i]=0
+	IOPSWrite[$i]=0
+	if [ ! -z "${vDISKs[$i]}" ]
+	then
+		IOPSRead[$i]=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $6}')
+		IOPSWrite[$i]=$(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $10}')
+	fi
+	if [ -z "${IOPSRead[$i]}" ]
+	then
+		IOPSRead[$i]=0
+	fi
+	if [ -z "${IOPSWrite[$i]}" ]
+	then
+		IOPSWrite[$i]=0
+	fi
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Disk $i Sector Bytes: $DiskstatsSectorSize Read Sectors: ${IOPSRead[$i]} Write Sectors: ${IOPSWrite[$i]}" >> "$ScriptPath"/debug.log; fi
+done
+
+# Zpool IOPS
+if [ -x "$(command -v zpool)" ]
+then
+	readarray -t zpoolsray < <(zpool list -H -o name)
+	if [ ${#zpoolsray[@]} -gt 0 ]
+	then
+		current_second=$(date +%S | sed 's/^0*//')
+		remaining_seconds=$((58 - current_second))
+		declare -A pipes
+		declare -A pipe_dirs
+		declare -A pids
+		declare -A zpools_mountpoints
+		for pool in "${zpoolsray[@]}"
+		do
+			zpools_mountpoints[$pool]=$(zfs get -H -o value mountpoint "$pool")
+			pipe_dir=$(mktemp -d "${TMPDIR:-/tmp}/luma_zpool.XXXXXX" 2>/dev/null)
+			if [ -z "$pipe_dir" ]
+			then
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to create zpool temp directory for $pool" >> "$ScriptPath"/debug.log; fi
+				continue
+			fi
+			pipe="$pipe_dir/iostat.fifo"
+			if ! mkfifo "$pipe"
+			then
+				rmdir "$pipe_dir" 2>/dev/null
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to create zpool FIFO for $pool" >> "$ScriptPath"/debug.log; fi
+				continue
+			fi
+			pipe_dirs[$pool]="$pipe_dir"
+			pipes[$pool]="$pipe"
+			timeout 60 zpool iostat -v -p "$pool" "$remaining_seconds" 2 | awk 'BEGIN{found=0} /capacity/ {found++} found==2' | grep -F -- "$pool" > "$pipe" &
+			pids[$pool]=$!
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool mounted at ${zpools_mountpoints[$pool]} starting iostat pid ${pids[$pool]} pipe ${pipes[$pool]} for $remaining_seconds seconds" >> "$ScriptPath"/debug.log; fi
+		done
+	fi
+fi
+
+# Calculate how many how many data sample loops
+RunTimes=$((60 / CollectEveryXSeconds))
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Collecting data for $RunTimes loops" >> "$ScriptPath"/debug.log; fi
+
+# Collect data loop
+for X in $(seq "$RunTimes")
+do
+	# Get vmstat
+	VMSTAT=$(vmstat "$CollectEveryXSeconds" 2 | tail -1)
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) $VMSTAT" >> "$ScriptPath"/debug.log; fi
+
+	# Read /proc/meminfo
+	read -r aRAMTotal aRAMFree aRAMAvailable aRAMHasAvailable aRAMBuffRaw aRAMCacheRaw aRAMShmem aRAMSReclaimable aRAMSwapTotal aRAMSwapFree < <(awk '
+		BEGIN {
+			memtotal=0; memfree=0; memavailable=0; buffers=0; cached=0;
+			memavailable_found=0; shmem=0; sreclaimable=0; swaptotal=0; swapfree=0;
+		}
+		/^MemTotal:/ { memtotal=$2 }
+		/^MemFree:/ { memfree=$2 }
+		/^MemAvailable:/ { memavailable=$2; memavailable_found=1 }
+		/^Buffers:/ { buffers=$2 }
+		/^Cached:/ { cached=$2 }
+		/^Shmem:/ { shmem=$2 }
+		/^SReclaimable:/ { sreclaimable=$2 }
+		/^SwapTotal:/ { swaptotal=$2 }
+		/^SwapFree:/ { swapfree=$2 }
+		END {
+			print memtotal, memfree, memavailable, memavailable_found, buffers, cached, shmem, sreclaimable, swaptotal, swapfree
+		}
+	' /proc/meminfo)
+
+	# CPU usage
+	CPU=$(echo "$VMSTAT" | awk '{print 100 - $15}')
+	tCPU=$(echo | awk "{print $tCPU + $CPU}")
+	
+	# CPU IO wait
+	CPUwa=$(echo "$VMSTAT" | awk '{print $16}')
+	tCPUwa=$(echo | awk "{print $tCPUwa + $CPUwa}")
+	
+	# CPU steal time
+	CPUst=$(echo "$VMSTAT" | awk '{print $17}')
+	tCPUst=$(echo | awk "{print $tCPUst + $CPUst}")
+
+	# CPU user time
+	CPUus=$(echo "$VMSTAT" | awk '{print $13}')
+	tCPUus=$(echo | awk "{print $tCPUus + $CPUus}")
+	
+	# CPU system time
+	CPUsy=$(echo "$VMSTAT" | awk '{print $14}')
+	tCPUsy=$(echo | awk "{print $tCPUsy + $CPUsy}")
+	
+	# CPU clock
+	CPUSpeed=$(grep 'cpu MHz' /proc/cpuinfo | awk -F": " '{print $2}' | awk '{printf "%18.0f",$1}' | xargs | sed -e 's/ /+/g')
+	if [ -z "$CPUSpeed" ]
+	then
+		CPUSpeed=0
+	fi
+	tCPUSpeed=$(echo | awk "{print $tCPUSpeed + $CPUSpeed}")
+
+	# CPU Load
+	loadavg=$(cat /proc/loadavg)
+	loadavg1=$(echo "$loadavg" | awk '{print $1}')
+	tloadavg1=$(echo | awk "{print $tloadavg1 + $loadavg1}")
+	loadavg5=$(echo "$loadavg" | awk '{print $2}')
+	tloadavg5=$(echo | awk "{print $tloadavg5 + $loadavg5}")
+	loadavg15=$(echo "$loadavg" | awk '{print $3}')
+	tloadavg15=$(echo | awk "{print $tloadavg15 + $loadavg15}")
+
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CPU: $CPU IO wait: $CPUwa Steal time: $CPUst User time: $CPUus System time: $CPUsy Load: $loadavg1 $loadavg5 $loadavg15" >> "$ScriptPath"/debug.log; fi
+
+	if [ "$aRAMHasAvailable" -eq 1 ]
+	then
+		aRAMUsed=$(( aRAMTotal - aRAMAvailable ))
+		if [ "$aRAMUsed" -lt 0 ]
+		then
+			aRAMUsed=0
+		fi
+
+		aRAMCacheReclaimable=$(( aRAMCacheRaw + aRAMSReclaimable - aRAMShmem ))
+		if [ "$aRAMCacheReclaimable" -lt 0 ]
+		then
+			aRAMCacheReclaimable=0
+		fi
+
+		aRAMReclaimableShown=$(( aRAMAvailable - aRAMFree ))
+		if [ "$aRAMReclaimableShown" -lt 0 ]
+		then
+			aRAMReclaimableShown=0
+		fi
+		aRAMReclaimableTotal=$(( aRAMBuffRaw + aRAMCacheReclaimable ))
+		if [ "$aRAMReclaimableShown" -gt "$aRAMReclaimableTotal" ]
+		then
+			aRAMReclaimableShown=$aRAMReclaimableTotal
+		fi
+
+		if [ "$aRAMReclaimableTotal" -gt 0 ]
+		then
+			aRAMBuffShown=$(( aRAMReclaimableShown * aRAMBuffRaw / aRAMReclaimableTotal ))
+			aRAMCacheShown=$(( aRAMReclaimableShown - aRAMBuffShown ))
+		else
+			aRAMBuffShown=0
+			aRAMCacheShown=0
+		fi
+	else
+		aRAMUsed=$(( aRAMTotal - aRAMFree - aRAMBuffRaw - aRAMCacheRaw ))
+		if [ "$aRAMUsed" -lt 0 ]
+		then
+			aRAMUsed=0
+		fi
+		aRAMBuffShown=$aRAMBuffRaw
+		aRAMCacheShown=$aRAMCacheRaw
+	fi
+
+	RAM=$(echo | awk "{print $aRAMUsed * 100 / $aRAMTotal}")
+	tRAM=$(echo | awk "{print $tRAM + $RAM}")
+
+	# RAM swap usage
+	aRAMSwapUsed=$(( aRAMSwapTotal - aRAMSwapFree ))
+	if [ "$aRAMSwapUsed" -lt 0 ]
+	then
+		aRAMSwapUsed=0
+	fi
+	if [ "$aRAMSwapTotal" -gt 0 ]
+	then
+		RAMSwap=$(echo | awk "{print $aRAMSwapUsed * 100 / $aRAMSwapTotal}")
+	else
+		RAMSwap=0
+	fi
+	tRAMSwap=$(echo | awk "{print $tRAMSwap + $RAMSwap}")
+
+	RAMBuff=$(echo | awk "{print $aRAMBuffShown * 100 / $aRAMTotal}")
+	tRAMBuff=$(echo | awk "{print $tRAMBuff + $RAMBuff}")
+
+	# RAM cache usage
+	RAMCache=$(echo | awk "{print $aRAMCacheShown * 100 / $aRAMTotal}")
+	tRAMCache=$(echo | awk "{print $tRAMCache + $RAMCache}")
+
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) RAM: $RAM Swap: $RAMSwap Buffers: $RAMBuff Cache: $RAMCache" >> "$ScriptPath"/debug.log; fi
+	
+	# Network usage
+	T=$(cat /proc/net/dev)
+	END=$(date +%s)
+	TIMEDIFF=$(echo | awk "{print $END - $START}")
+	tTIMEDIFF=$(echo | awk "{print $tTIMEDIFF + $TIMEDIFF}")
+	START=$(date +%s)
+	
+	# Loop through network interfaces
+	for NIC in "${NetworkInterfacesArray[@]}"
+	do
+		# Received Traffic
+		RX=$(echo | awk "{print $(echo "$T" | grep -w "$NIC:" | awk '{print $2}') - ${aRX[$NIC]}}")
+		RX=$(echo | awk "{print $RX / $TIMEDIFF}")
+		RX=$(echo "$RX" | awk '{printf "%18.0f",$1}' | xargs)
+		aRX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $2}')
+		tRX[$NIC]=$(echo | awk "{print ${tRX[$NIC]} + $RX}")
+		tRX[$NIC]=$(echo "${tRX[$NIC]}" | awk '{printf "%18.0f",$1}' | xargs)
+		# Transferred Traffic
+		TX=$(echo | awk "{print $(echo "$T" | grep -w "$NIC:" | awk '{print $10}') - ${aTX[$NIC]}}")
+		TX=$(echo | awk "{print $TX / $TIMEDIFF}")
+		TX=$(echo "$TX" | awk '{printf "%18.0f",$1}' | xargs)
+		aTX[$NIC]=$(echo "$T" | grep -w "$NIC:" | awk '{print $10}')
+		tTX[$NIC]=$(echo | awk "{print ${tTX[$NIC]} + $TX}")
+		tTX[$NIC]=$(echo "${tTX[$NIC]}" | awk '{printf "%18.0f",$1}' | xargs)
+	done
+
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Traffic: ${tRX[*]} ${tTX[*]}" >> "$ScriptPath"/debug.log; fi
+	
+	# Port connections
+	if [ -n "$ConnectionPorts" ]
+	then
+		netstat=$(ss -ntu | awk '{print $5}')
+		for cPort in "${ConnectionPortsArray[@]}"
+		do
+			PortConnectionCount=$(echo "$netstat" | grep -c ":$cPort$")
+			Connections["$cPort"]=$(( ${Connections["$cPort"]:-0} + PortConnectionCount ))
+		done
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port Connections: ${Connections[*]}" >> "$ScriptPath"/debug.log; fi
+	fi
+
+	# Temperature (thermal_zone)
+	if [ "$(find /sys/class/thermal/thermal_zone*/type 2> /dev/null | wc -l)" -gt 0 ]
+	then
+		TempArrayIndex=()
+		TempArrayVal=()
+		for zone in /sys/class/thermal/thermal_zone*/
+		do
+			if [[ -f "${zone}/type" ]] && [[ -f "${zone}/temp" ]]
+			then
+				type_value=$(<"${zone}/type")
+				temp_value=$(<"${zone}/temp")
+				if [[ -n $type_value ]]
+				then
+					TempArrayIndex+=("$type_value")
+				fi
+				if [[ $temp_value =~ ^[0-9]+$ ]]
+				then
+					TempArrayVal+=("$temp_value")
+				else
+					TempArrayVal+=("0")
+				fi
+			fi
+		done
+		TempNameCnt=0
+		for TempName in "${TempArrayIndex[@]}"
+		do
+			TempArray[$TempName]=${TempArray[$TempName]:-0}
+			TempArrayCnt[$TempName]=${TempArrayCnt[$TempName]:-0}
+			if [[ ${TempArrayVal[$TempNameCnt]} =~ ^[0-9]+$ ]]
+			then
+				TempArray[$TempName]=$((${TempArray[$TempName]} + ${TempArrayVal[$TempNameCnt]}))
+				TempArrayCnt[$TempName]=$((TempArrayCnt[$TempName] + 1))
+			fi
+			TempNameCnt=$((TempNameCnt + 1))
+		done
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature thermal_zone: ${TempArray[*]}" >> "$ScriptPath"/debug.log; fi
+	fi
+
+	# Temperature (sensors)
+	if command -v "sensors" > /dev/null 2>&1 && [ "$SensorsCmdDisable" -eq 0 ]
+	then
+		SensorsCmd=$(LANG=en_US.UTF-8 sensors -A 2>/dev/null)
+		if [ $? -eq 0 ]
+		then
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Sensors command output:\n$SensorsCmd" >> "$ScriptPath"/debug.log; fi
+			SensorsArray=()
+			SensorsCoreSum=0
+			SensorsCoreCnt=0
+			while IFS='' read -r line; do SensorsArray+=("$line"); done <<< "$SensorsCmd"
+			for i in "${SensorsArray[@]}"
+			do
+				if [ -n "$i" ]
+				then
+					if [[ "$i" != *":"* ]] && [[ "$i" != *"="* ]]
+					then
+						SensorsCat=$(echo "$i" | xargs)
+					else
+						if [[ "$i" == *":"* ]]
+						then
+							TempLabel=$(echo "$i" | awk -F":" '{print $1}' | xargs | sed 's/ /_/g')
+							TempRaw=$(echo "$i" | awk -F":" '{print $2}' | grep -oE '[-+]?[0-9]+(\.[0-9]+)?' | head -n 1)
+							if [ -n "$TempRaw" ]
+							then
+								TempName="$SensorsCat|$TempLabel"
+								TempVal=$(awk -v val="$TempRaw" 'BEGIN { printf "%18.3f", val }' | sed 's/\.//g' | xargs)
+								TempArray[$TempName]=${TempArray[$TempName]:-0}
+								TempArray[$TempName]=$((TempArray[$TempName] + TempVal))
+								TempArrayCnt[$TempName]=${TempArrayCnt[$TempName]:-0}
+								TempArrayCnt[$TempName]=$((TempArrayCnt[$TempName] + 1))
+								if [[ "$TempName" == *"|Core_"* ]]
+								then
+									SensorsCoreSum=$((SensorsCoreSum + TempVal))
+									SensorsCoreCnt=$((SensorsCoreCnt + 1))
+								fi
+							fi
+						fi
+					fi
+				fi
+			done
+			if [ "$SensorsCoreCnt" -gt 0 ]
+			then
+				SensorAvgName="AllCoreAvg"
+				TempArray[$SensorAvgName]=${TempArray[$SensorAvgName]:-0}
+				TempArrayCnt[$SensorAvgName]=${TempArrayCnt[$SensorAvgName]:-0}
+				TempArray[$SensorAvgName]=$((TempArray[$SensorAvgName] + (SensorsCoreSum / SensorsCoreCnt)))
+				TempArrayCnt[$SensorAvgName]=$((TempArrayCnt[$SensorAvgName] + 1))
+			fi
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature sensors: ${TempArray[*]}" >> "$ScriptPath"/debug.log; fi
+		else
+			SensorsCmdDisable=1
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to get temperature via sensors" >> "$ScriptPath"/debug.log; fi
+		fi
+	fi
+
+	# Check if minute changed, so we can end the loop
+	MM=$(date +%M | sed 's/^0*//')
+	if [ -z "$MM" ]
+	then
+		MM=0
+	fi
+	if [ "$MM" -ne "$M" ] 
+	then
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Minute changed, ending loop" >> "$ScriptPath"/debug.log; fi
+		break
+	fi
+done
+
+# Temperature (ipmitool) - just once due to slowness
+if command -v "ipmitool" > /dev/null 2>&1
+then
+	IPMIArray=()
+	while IFS='' read -r line; do IPMIArray+=("$line"); done < <(timeout -s 9 5 ipmitool sdr type Temperature)
+	for i in "${IPMIArray[@]}"
+	do
+		if [ -n "$i" ]
+		then
+			if [[ "$i" == *"degrees"* ]]
+			then
+				TempName=$(echo "$i" | awk -F"|" '{print $1}' | xargs | sed 's/ /_/g')
+				TempVal=$(echo "$i" | awk -F"|" '{print $NF}' | awk -F"degrees" '{print $1}' | sed 's/ //g' | awk '{printf "%18.3f",$1}' | sed -e 's/\.//g' | xargs)
+				TempArray[$TempName]=${TempArray[$TempName]:-0}
+				TempArray[$TempName]=$((TempArray[$TempName] + TempVal))
+				TempArrayCnt[$TempName]=${TempArrayCnt[$TempName]:-0}
+				TempArrayCnt[$TempName]=$((TempArrayCnt[$TempName] + 1))
+			fi
+		fi
+	done
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature ipmitool: ${TempArray[*]}" >> "$ScriptPath"/debug.log; fi
+fi
+
+# Get user running the agent
+User=$(whoami)
+
+# Check if system requires reboot
+RequiresReboot=0
+if [ "$CheckReboot" -eq 1 ] && [ -f  /var/run/reboot-required ]
+then
+	RequiresReboot=1
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot required by /var/run/reboot-required" >> "$ScriptPath"/debug.log; fi
+fi
+
+# Operating System
+# Check via lsb_release if possible
+if command -v "lsb_release" > /dev/null 2>&1
+then
+	OS=$(lsb_release -s -d)
+# Check if it's Debian
+elif [ -f /etc/debian_version ]
+then
+	OS="Debian $(cat /etc/debian_version)"
+# Check if it's CentOS/Fedora
+elif [ -f /etc/redhat-release ]
+then
+	OS=$(cat /etc/redhat-release)
+# If all else fails
+else
+	OS="$(grep '^PRETTY_NAME=' /etc/os-release | awk -F'"' '{print $2}')" || OS="$(uname -s)" || OS="Linux"
+fi
+
+# Avoid needs-restarting unless an sqlite RPMDB is present; BDB readers can leave the RPMDB in recovery state if too slow to respond and are killed
+if [ -f /etc/redhat-release ]
+then
+	if [ "$CheckReboot" -eq 1 ]
+	then
+		if ! rpmdbhassqlitebackend
+		then
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check skipped because RPMDB sqlite backend was not detected" >> "$ScriptPath"/debug.log; fi
+		elif ! command -v "needs-restarting" > /dev/null 2>&1
+		then
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check skipped because needs-restarting was not found" >> "$ScriptPath"/debug.log; fi
+		else
+			RebootCheckCache="$ScriptPath"/luma_reboot_check.cache
+			if [ -r /proc/sys/kernel/random/boot_id ]
+			then
+				read -r RebootCheckBootID < /proc/sys/kernel/random/boot_id
+			fi
+			[ -n "$RebootCheckBootID" ] || RebootCheckBootID="unknown"
+			debugrebootcheckcache "$RebootCheckCache"
+			if [ -f "$RebootCheckCache" ]
+			then
+				read -r CachedRebootCheckBootID CachedRequiresReboot < "$RebootCheckCache"
+			fi
+			RebootCheckCacheFresh=0
+			RebootCheckCacheSameBoot=0
+			if [ "$CachedRebootCheckBootID" = "$RebootCheckBootID" ] && [[ "$CachedRequiresReboot" =~ ^[01]$ ]]
+			then
+				RebootCheckCacheSameBoot=1
+				RebootCheckCacheMTime=$(filemtime "$RebootCheckCache")
+				RebootCheckNow=$(date +%s)
+				if [[ "$RebootCheckCacheMTime" =~ ^[0-9]+$ ]] && [[ "$RebootCheckNow" =~ ^[0-9]+$ ]] &&
+					[ "$RebootCheckNow" -ge "$RebootCheckCacheMTime" ] && [ $(( RebootCheckNow - RebootCheckCacheMTime )) -lt 3600 ]
+				then
+					RebootCheckCacheFresh=1
+				fi
+			fi
+			if [ "$RebootCheckCacheFresh" -eq 1 ]
+			then
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check using cache $RebootCheckCache value=$CachedRequiresReboot" >> "$ScriptPath"/debug.log; fi
+				if [ "$CachedRequiresReboot" = "1" ]
+				then
+					RequiresReboot=1
+				fi
+			else
+				if rpmpackagetoolrunning
+				then
+					if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check skipped because RPM package tools are running" >> "$ScriptPath"/debug.log; fi
+					if [ "$RebootCheckCacheSameBoot" -eq 1 ] && [ "$CachedRequiresReboot" = "1" ]
+					then
+						RequiresReboot=1
+					fi
+				else
+					NeedsRestartingRequiresReboot=0
+					NeedsRestartingOutput=$(needsrestartingwithtimeout)
+					NeedsRestartingExit=$?
+					if printf '%s\n' "$NeedsRestartingOutput" | grep -q 'Reboot is required'
+					then
+						NeedsRestartingRequiresReboot=1
+						RequiresReboot=1
+						writerebootcheckcache "$RebootCheckBootID" "$NeedsRestartingRequiresReboot" "$RebootCheckCache"
+						debugrebootcheckcache "$RebootCheckCache"
+						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) needs-restarting reported reboot required, exit=$NeedsRestartingExit cache=$RebootCheckCache" >> "$ScriptPath"/debug.log; fi
+					elif [ "$NeedsRestartingExit" -eq 0 ]
+					then
+						writerebootcheckcache "$RebootCheckBootID" "$NeedsRestartingRequiresReboot" "$RebootCheckCache"
+						debugrebootcheckcache "$RebootCheckCache"
+						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) needs-restarting reported no reboot required, cache=$RebootCheckCache" >> "$ScriptPath"/debug.log; fi
+					else
+						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) needs-restarting failed or timed out, exit=$NeedsRestartingExit cache not updated" >> "$ScriptPath"/debug.log; fi
+						if [ "$CachedRebootCheckBootID" = "$RebootCheckBootID" ] && [ "$CachedRequiresReboot" = "1" ]
+						then
+							RequiresReboot=1
+						fi
+					fi
+				fi
+			fi
+		fi
+	fi
+fi
+OS=$(echo -ne "$OS" | base64 | tr -d '\n\r\t ')
+
+# Kernel
+Kernel=$(uname -r | base64 | tr -d '\n\r\t ')
+
+# Hostname
+Hostname=$(uname -n | base64 | tr -d '\n\r\t ')
+
+# Server uptime
+Uptime=$(awk '{print $1}' < /proc/uptime | awk '{printf "%18.0f",$1}' | xargs)
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) User: $User OS: $OS Kernel: $Kernel Hostname: $Hostname Uptime: $Uptime RequiresReboot: $RequiresReboot" >> "$ScriptPath"/debug.log; fi
+
+# lscpu
+lscpu=$(lscpu)
+
+# CPU model
+CPUModel=$(grep -m1 -E 'model name|cpu model' /proc/cpuinfo | awk -F": " '{print $NF}' | xargs)
+if [ -z "$CPUModel" ]
+then
+	CPUModel=$(echo "$lscpu" | grep "^Model name:" | awk -F": " '{print $NF}' | xargs)
+fi
+CPUModel=$(echo -ne "$CPUModel" | base64 | tr -d '\n\r\t ')
+
+# CPU sockets
+CPUSockets=$(grep -i "physical id" /proc/cpuinfo | sort -u | wc -l)
+
+# CPU cores
+CPUCores=$(echo "$lscpu" | grep "^CPU(s):" | awk '{print $(NF)}' | xargs)
+
+# CPU threads
+CPUThreads=$(echo "$lscpu" | grep "^Thread(s) per core:" | awk '{print $(NF)}' | xargs)
+
+# CPU clock speed
+if [ -z "$tCPUSpeed" ] || [ "$tCPUSpeed" -eq 0 ]
+then
+	CPUSpeed=$(echo "$lscpu" | grep "^CPU max MHz" | awk '{print $NF}' | awk '{printf "%18.0f",$1}' | xargs)
+else
+	CPUSpeed=$(echo | awk "{print $tCPUSpeed / $CPUCores / $X}" | awk '{printf "%18.0f",$1}' | xargs)
+fi
+
+# Average CPU usage
+CPU=$(echo | awk "{print $tCPU / $X}")
+
+# Average CPU IO wait
+CPUwa=$(echo | awk "{print $tCPUwa / $X}")
+
+# Average CPU steal time
+CPUst=$(echo | awk "{print $tCPUst / $X}")
+
+# Average CPU user time
+CPUus=$(echo | awk "{print $tCPUus / $X}")
+
+# Average CPU system time
+CPUsy=$(echo | awk "{print $tCPUsy / $X}")
+
+# CPU Load
+loadavg1=$(echo | awk "{print $tloadavg1 / $X}")
+loadavg5=$(echo | awk "{print $tloadavg5 / $X}")
+loadavg15=$(echo | awk "{print $tloadavg15 / $X}")
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CPU Model: $CPUModel Sockets: $CPUSockets Cores: $CPUCores Threads: $CPUThreads Speed: $CPUSpeed CPU: $CPU IO wait: $CPUwa Steal time: $CPUst User time: $CPUus System time: $CPUsy Load: $loadavg1 $loadavg5 $loadavg15" >> "$ScriptPath"/debug.log; fi
+
+# RAM size
+RAMSize=$aRAMTotal
+
+# RAM Usage
+RAM=$(echo | awk "{print $tRAM / $X}")
+
+# RAM swap size
+RAMSwapSize=$aRAMSwapTotal
+
+# RAM swap usage
+if [ "$RAMSwapSize" -gt 0 ]
+then
+	RAMSwap=$(echo | awk "{print $tRAMSwap / $X}")
+else
+	RAMSwap=0
+fi
+
+# RAM buffers usage
+RAMBuff=$(echo | awk "{print $tRAMBuff / $X}")
+
+# RAM cache usage
+RAMCache=$(echo | awk "{print $tRAMCache / $X}")
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) RAM Size: $RAMSize Usage: $RAM Swap Size: $RAMSwapSize Usage: $RAMSwap Buffers: $RAMBuff Cache: $RAMCache" >> "$ScriptPath"/debug.log; fi
+
+# Disks inodes
+df_inodes_output=$(timeout 3 df -Ti 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$df_inodes_output" ]
+then
+	df_inodes_output=$(timeout 3 df -l -Ti 2>/dev/null)
+fi
+INODEs=$(echo -ne "$(echo "$df_inodes_output" | sed 1d | filterignoreddisks | awk '{print $(NF)","$3","$4","$5";"}')" | tr -d '\n\r\t ' | base64 | tr -d '\n\r\t ')
+
+# Disks IOPS
+IOPS=""
+diskstats=$(cat /proc/diskstats)
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) /proc/diskstats:\n$diskstats" >> "$ScriptPath"/debug.log; fi
+for i in "${!vDISKs[@]}"
+do
+	IOPSRead[$i]=$(echo | awk "{print $(echo | awk "{print $(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $6}') - ${IOPSRead[$i]}}" 2> /dev/null) * $DiskstatsSectorSize / $tTIMEDIFF}" 2> /dev/null)
+	IOPSRead[$i]=$(echo "${IOPSRead[$i]}" | awk '{printf "%18.0f",$1}' | xargs)
+	IOPSWrite[$i]=$(echo | awk "{print $(echo | awk "{print $(echo "$diskstats" | grep -w "${vDISKs[$i]}" | awk '{print $10}') - ${IOPSWrite[$i]}}" 2> /dev/null) * $DiskstatsSectorSize / $tTIMEDIFF}" 2> /dev/null)
+	IOPSWrite[$i]=$(echo "${IOPSWrite[$i]}" | awk '{printf "%18.0f",$1}' | xargs)
+	IOPS="$IOPS$i,${IOPSRead[$i]},${IOPSWrite[$i]};"
+done
+# Zpool IOPS
+if [ -x "$(command -v zpool)" ]
+then
+	if [ ${#zpoolsray[@]} -gt 0 ]
+	then
+		for pool in "${zpoolsray[@]}"
+		do
+			if [ -z "${pipes[$pool]}" ]
+			then
+				continue
+			fi
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool mounted at ${zpools_mountpoints[$pool]} reading from iostat pipe" >> "$ScriptPath"/debug.log; fi
+			zpooloutput=$(<"${pipes[$pool]}")
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool iostat output: $zpooloutput" >> "$ScriptPath"/debug.log; fi
+			if [ "$zpooloutput" != "Terminated" ] && [ -n "$zpooloutput" ]
+			then
+				read_bytes_per_sec=$(echo "$zpooloutput" | awk '{print $(NF-1)}')
+				write_bytes_per_sec=$(echo "$zpooloutput" | awk '{print $NF}')
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool read bytes per sec: $read_bytes_per_sec write bytes per sec: $write_bytes_per_sec" >> "$ScriptPath"/debug.log; fi
+				IOPS="$IOPS${zpools_mountpoints[$pool]},$read_bytes_per_sec,$write_bytes_per_sec;"
+			fi
+			kill "${pids[$pool]}" 2>/dev/null
+			rm -f "${pipes[$pool]}" 2>/dev/null
+			rmdir "${pipe_dirs[$pool]}" 2>/dev/null
+		done
+	fi
+fi
+IOPS=$(echo -ne "$IOPS" | base64 | tr -d '\n\r\t ')
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) lsblk: $(lsblk -l | base64 | tr -d '\n\r\t ') Disks: $DISKs Inodes: $INODEs IOPS: $IOPS" >> "$ScriptPath"/debug.log; fi
+
+# Total network usage and IP addresses
+RX=0
+TX=0
+NICS=""
+IPv4=""
+IPv6=""
+for NIC in "${NetworkInterfacesArray[@]}"
+do
+	# Individual NIC network usage
+	RX=$(echo | awk "{print ${tRX[$NIC]} / $X}")
+	RX=$(echo "$RX" | awk '{printf "%18.0f",$1}' | xargs)
+	TX=$(echo | awk "{print ${tTX[$NIC]} / $X}")
+	TX=$(echo "$TX" | awk '{printf "%18.0f",$1}' | xargs)
+	NICS="$NICS$NIC,$RX,$TX;"
+	# Individual NIC IP addresses
+	IPv4="$IPv4$NIC,$(ip -4 addr show "$NIC" | grep -oP 'inet \K[\d.]+' | xargs | sed 's/ /,/g');"
+	IPv6="$IPv6$NIC,$(ip -6 addr show "$NIC" | grep -w "global" | grep -oP 'inet6 \K[0-9a-fA-F:]+' | xargs | sed 's/ /,/g');"
+done
+NICS=$(echo -ne "$NICS" | base64 | tr -d '\n\r\t ')
+IPv4=$(echo -ne "$IPv4" | base64 | tr -d '\n\r\t ')
+IPv6=$(echo -ne "$IPv6" | base64 | tr -d '\n\r\t ')
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Network Interfaces: $NICS IPv4: $IPv4 IPv6: $IPv6" >> "$ScriptPath"/debug.log; fi
+
+# Port connections
+CONN=""
+if [ -n "$ConnectionPorts" ]
+then
+	for cPort in "${ConnectionPortsArray[@]}"
+	do
+		CON=$(awk -v connections="${Connections["$cPort"]:-0}" -v loops="$X" 'BEGIN {print connections / loops}')
+		CON=$(echo "$CON" | awk '{printf "%18.0f",$1}' | xargs)
+		CONN="$CONN$cPort,$CON;"
+	done
+fi
+CONN=$(echo -ne "$CONN" | base64 | tr -d '\n\r\t ')
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port Connections: $CONN" >> "$ScriptPath"/debug.log; fi
+
+# Temperature
+TEMP=""
+if [ -n "$TempName" ]
+then
+	for TempName in "${!TempArray[@]}"
+	do
+		TMP=$(echo | awk "{print ${TempArray[$TempName]} / ${TempArrayCnt[$TempName]}}")
+		TMP=$(echo "$TMP" | awk '{printf "%18.0f",$1}' | xargs)
+		TEMP="$TEMP$TempName,$TMP;"
+	done
+fi
+TEMP=$(echo -ne "$TEMP" | base64 | tr -d '\n\r\t ')
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Temperature: $TEMP" >> "$ScriptPath"/debug.log; fi
+
+# Check Services
+SRVCS=""
+if [ -n "$CheckServices" ]
+then
+	for i in "${CheckServicesArray[@]}"
+	do
+		ServiceStatus=$(servicestatus "$i")
+		SRVCSR["$i"]=$(( ${SRVCSR["$i"]:-0} + ServiceStatus ))
+		if [ "${SRVCSR["$i"]}" -eq "0" ]
+		then
+			SRVCS="$SRVCS$i,0;"
+		else
+			SRVCS="$SRVCS$i,1;"
+		fi
+	done
+fi
+SRVCS=$(echo -ne "$SRVCS" | base64 | tr -d '\n\r\t ')
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Services: $SRVCS" >> "$ScriptPath"/debug.log; fi
+
+# Check Software RAID
+RAID=""
+ZP=""
+dfPB1=$(timeout 3 df -PB1 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$dfPB1" ]
+then
+	dfPB1=$(timeout 3 df -l -PB1 2>/dev/null)
+fi
+declare -A zpooldiskusage
+if [ "$CheckSoftRAID" -gt 0 ]
+then
+	mdarrays=()
+	while IFS= read -r mdname; do
+		mdname=${mdname%:}
+		if [ -n "$mdname" ]; then mdarrays+=("$mdname"); fi
+	done < <(awk '/^md[0-9]+[[:space:]]*:/ {print $1}' /proc/mdstat 2>/dev/null)
+	for md in "${mdarrays[@]}"
+	do
+		mddev="/dev/$md"
+		mdadm=$(mdadm -D "$mddev" 2>/dev/null)
+		# DEBUG
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) mdadm -D $mddev:\n$mdadm" >> "$ScriptPath"/debug.log; fi
+		if [ -n "$mdadm" ]
+		then
+			mnt=$(findmnt -rn -S "$mddev" -o TARGET 2>/dev/null | head -n1)
+			if [ -z "$mnt" ]; then
+				lsblk_mounts=$(lsblk -nrpo NAME,${lsblk_mnt_option} "$mddev" 2>/dev/null | awk '$2!=""{print $2}')
+				if [ -n "$lsblk_mounts" ]; then
+					mnt=$(printf '%s\n' "$lsblk_mounts" | awk '/^\// {print length, $0}' | sort -n | awk '{print $2}' | tail -n1)
+					if [ -z "$mnt" ]; then
+						mnt=$(printf '%s\n' "$lsblk_mounts" | awk '{print length, $0}' | sort -n | awk '{print $2}' | tail -n1)
+					fi
+				fi
+			fi
+			# DEBUG
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) md $mddev -> chosen mountpoint: ${mnt:--}" >> "$ScriptPath"/debug.log; fi
+			if [ -z "$mnt" ]; then 
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) No mountpoint found for $mddev" >> "$ScriptPath"/debug.log; fi
+			else
+				RAID="$RAID$mnt,$mddev,$mdadm;"
+			fi
+		fi
+	done
+	if [ -x "$(command -v zpool)" ]
+	then
+		zpoolsoverall=$(zpool status 2>/dev/null)
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool status:\n$zpoolsoverall" >> "$ScriptPath"/debug.log; fi
+		if ! grep -q "no pools available" <<< "$zpoolsoverall"
+		then
+			zpools=()
+			while IFS= read -r line; do zpools+=("$line"); done < <(echo -ne "$zpoolsoverall"  2>/dev/null | grep "pool: " | awk '{print $2}')
+			for i in "${zpools[@]}"
+			do
+				zpoolstatus=$(zpool status "$i" 2>/dev/null)
+				zpoolstatus=$(echo -ne "$zpoolstatus" | base64 | tr -d '\n\r\t ')
+				mnt=$(echo -ne "$dfPB1" | grep -E "${i}[ /]" | head -n 1 | awk '{print $(NF)}')
+				ZP="$ZP$mnt,$i,$zpoolstatus;"
+				zpooldiskusage[$mnt]=$(zfs get -H -o value -p used,avail "$i" | xargs | awk '{printf "%.0f %.0f %.0f", $1+$2, $1, $2}')
+			done
+		fi
+	fi
+fi
+# Disks usage
+DISKs=""
+declare -A ProcessedMountPoints
+declare -A ProcessedThinRaid
+declare -A VGSoftRaidMap
+df_disk_usage=$(timeout 3 df -TPB1 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$df_disk_usage" ]
+then
+	df_disk_usage=$(timeout 3 df -l -TPB1 2>/dev/null)
+fi
+IFS=$'\n' read -d '' -r -a DISKsArray < <(printf '%s\n' "$df_disk_usage" | sed 1d | filterignoreddisks | awk '{print $(NF)","$2","$3","$4","$5";"}')
+for i in "${DISKsArray[@]}"
+do
+	IFS=',' read -r mount_point filesystem_type total_size used_size available_size <<< "$i"
+	if [ -n "${zpooldiskusage[$mount_point]}" ]
+	then
+		IFS=' ' read -r zpool_total zpool_allocated zpool_free <<< "${zpooldiskusage[$mount_point]}"
+		total_size=$zpool_total
+		used_size=$zpool_allocated
+		available_size=$zpool_free
+	fi
+	ProcessedMountPoints[$mount_point]=1
+	DISKs="$DISKs$mount_point,$filesystem_type,$total_size,$used_size,$available_size;"
+done
+
+# Include thin LVM pools without mountpoints
+if [ "$CheckSoftRAID" -gt 0 ] && [ -x "$(command -v pvs)" ]
+then
+	while IFS=',' read -r pv_name vg_name_pv
+	do
+		pv_name=$(echo "$pv_name" | xargs)
+		vg_name_pv=$(echo "$vg_name_pv" | xargs)
+
+		if [ -z "$pv_name" ] || [ -z "$vg_name_pv" ]
+		then
+			continue
+		fi
+
+		if [[ "$pv_name" != /dev/* ]]
+		then
+			pv_name="/dev/$pv_name"
+		fi
+
+		if [[ "$pv_name" =~ ^/dev/md[0-9]+$ ]]
+		then
+			if [ -n "${VGSoftRaidMap[$vg_name_pv]}" ]
+			then
+				case " ${VGSoftRaidMap[$vg_name_pv]} " in
+					*" $pv_name "*) : ;;
+					*) VGSoftRaidMap[$vg_name_pv]="${VGSoftRaidMap[$vg_name_pv]} $pv_name" ;;
+				esac
+			else
+				VGSoftRaidMap[$vg_name_pv]="$pv_name"
+			fi
+		fi
+	done < <(pvs --noheadings --separator ',' -o pv_name,vg_name 2>/dev/null)
+fi
+
+if [ -x "$(command -v lvs)" ]
+then
+	while IFS=',' read -r lv_name vg_name lv_path lv_attr lv_size data_percent lv_tags
+	do
+		lv_name=$(echo "$lv_name" | xargs)
+		vg_name=$(echo "$vg_name" | xargs)
+		lv_path=$(echo "$lv_path" | xargs)
+		lv_attr=$(echo "$lv_attr" | xargs)
+		lv_size=$(echo "$lv_size" | xargs)
+		data_percent=$(echo "$data_percent" | xargs)
+		lv_tags=$(echo "$lv_tags" | xargs)
+
+		if [ -z "$lv_name" ] || [ -z "$vg_name" ] || [ -z "$lv_attr" ] || [ -z "$lv_size" ]
+		then
+			continue
+		fi
+		
+		if [[ "$lv_attr" != t* ]] || [[ "$lv_name" == *_tdata ]] || [[ "$lv_name" == *_tmeta ]]
+		then
+			continue
+		fi
+
+		if [ -z "$lv_path" ]
+		then
+			lv_path="/dev/$vg_name/$lv_name"
+		fi
+		if findmnt -rn -S "$lv_path" >/dev/null 2>&1
+		then
+			continue
+		fi
+
+		pseudo_tag=$(echo "$lv_tags" | tr ',' '\n' | tr -d ' ' | grep -E '^[A-Za-z0-9._-]+$' | head -n1)
+		if [ -n "$pseudo_tag" ]
+		then
+			mount_point="/$pseudo_tag"
+		else
+			mount_point="/$lv_name"
+		fi
+		if [ -n "${ProcessedMountPoints[$mount_point]}" ]
+		then
+			continue
+		fi
+
+		if ! [[ "$lv_size" =~ ^[0-9]+$ ]]
+		then
+			continue
+		fi
+
+		if ! [[ "$data_percent" =~ ^[0-9.]+$ ]]
+		then
+			data_percent="0"
+		fi
+
+		used_size=$(awk -v size="$lv_size" -v pct="$data_percent" 'BEGIN {printf "%.0f", size * pct / 100}')
+		available_size=$(( lv_size - used_size ))
+		if [ "$available_size" -lt 0 ]
+		then
+			available_size=0
+		fi
+
+		ProcessedMountPoints[$mount_point]=1
+		DISKs="$DISKs$mount_point,lvm,$lv_size,$used_size,$available_size;"
+
+		if [ "$CheckSoftRAID" -gt 0 ]
+		then
+			declare -A ThinPoolCandidates=()
+
+			if [ -n "${VGSoftRaidMap[$vg_name]}" ]
+			then
+				for md_candidate in ${VGSoftRaidMap[$vg_name]}
+				do
+					if [ -n "$md_candidate" ]
+					then
+						ThinPoolCandidates["$md_candidate"]=1
+					fi
+				done
+			fi
+
+			lv_devices_output=$(lvs --noheadings -o devices "$lv_path" 2>/dev/null | tr -d ' ')
+			if [ -n "$lv_devices_output" ]
+			then
+				IFS=',' read -r -a lv_devices_array <<< "$lv_devices_output"
+				for device_entry in "${lv_devices_array[@]}"
+				do
+					device_entry=${device_entry%%(*}
+					if [ -z "$device_entry" ]
+					then
+						continue
+					fi
+					if [[ "$device_entry" != /dev/* ]]
+					then
+						device_entry="/dev/$device_entry"
+					fi
+					if [[ "$device_entry" =~ ^/dev/md[0-9]+$ ]]
+					then
+						ThinPoolCandidates["$device_entry"]=1
+					fi
+				done
+			fi
+
+			if [ "${#ThinPoolCandidates[@]}" -eq 0 ]
+			then
+				while IFS=' ' read -r raid_device raid_type raid_parent
+				do
+					if [[ -z "$raid_device" ]] || [[ "$raid_device" == "$lv_path" ]]
+					then
+						continue
+					fi
+
+					normalized_device="$raid_device"
+					if [[ "$normalized_device" != /dev/* ]]
+					then
+						normalized_device="/dev/$normalized_device"
+					fi
+
+					if [[ "$normalized_device" =~ ^/dev/md[0-9]+$ ]]
+					then
+						ThinPoolCandidates["$normalized_device"]=1
+					elif [[ "$raid_type" == raid* ]] && [[ "$normalized_device" =~ ^/dev/md[0-9]+$ ]]
+					then
+						ThinPoolCandidates["$normalized_device"]=1
+					elif [[ -n "$raid_parent" ]] && [[ "$raid_parent" =~ ^md[0-9]+$ ]]
+					then
+						ThinPoolCandidates["/dev/$raid_parent"]=1
+					fi
+				done < <(lsblk -nrpo NAME,TYPE,PKNAME "$lv_path" 2>/dev/null)
+			fi
+
+			for md_candidate in "${!ThinPoolCandidates[@]}"
+			do
+				if [ -z "$md_candidate" ]
+				then
+					continue
+				fi
+				mdadm_details=$(mdadm -D "$md_candidate" 2>/dev/null)
+				if [ -z "$mdadm_details" ]
+				then
+					continue
+				fi
+
+				raid_key="${mount_point}|${md_candidate}"
+				if [ -n "${ProcessedThinRaid[$raid_key]}" ]
+				then
+					continue
+				fi
+
+				ProcessedThinRaid[$raid_key]=1
+				RAID="$RAID$mount_point,$md_candidate,$mdadm_details;"
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Linked thin LVM pool $lv_path to RAID $md_candidate" >> "$ScriptPath"/debug.log; fi
+			done
+		fi
+
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Added thin LVM pool $lv_path as $mount_point Size: $lv_size Used: $used_size Free: $available_size" >> "$ScriptPath"/debug.log; fi
+	done < <(lvs --noheadings --separator ',' --units B --nosuffix -o lv_name,vg_name,lv_path,lv_attr,lv_size,data_percent,lv_tags 2>/dev/null)
+fi
+RAID=$(echo -ne "$RAID" | base64 | tr -d '\n\r\t ')
+ZP=$(echo -ne "$ZP" | base64 | tr -d '\n\r\t ')
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) RAID: $RAID ZP: $ZP" >> "$ScriptPath"/debug.log; fi
+DISKs=$(echo -ne "$DISKs" | base64 | tr -d '\n\r\t ')
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) DISKs: $DISKs" >> "$ScriptPath"/debug.log; fi
+
+# Check Drive Health
+DH=""
+SeenSerials=""
+if [ "$CheckDriveHealth" -gt 0 ]
+then
+	if [ -x "$(command -v smartctl)" ] #Using S.M.A.R.T. (for regular HDD/SSD)
+	then
+		MegaRaidChecked=0
+		HPCCISSChecked=0
+		HardwareRaidPresent=0
+		RaidSasN=0
+		for i in $(lsblk -lp | grep ' disk' | awk '{print $1}')
+		do
+			case "$i" in /dev/nvme*) continue;; esac
+			DHealth=$(smartctl -A "$i")
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -A $i:\n$DHealth" >> "$ScriptPath"/debug.log; fi
+			if grep -q 'Attribute' <<< "$DHealth"
+			then
+				DHealth=$(smartctl -H "$i")"\n$DHealth"
+				DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
+				DInfo="$(smartctl -i "$i")"
+				DModel="$(echo "$DInfo" | grep -i "Device Model:" | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+				DSerial="$(echo "$DInfo" | grep -i "Serial Number:" | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+				i=${i##*/}
+				if [ -z "$DSerial" ] || [[ "$SeenSerials" != *"|$DSerial|"* ]]
+				then
+					SeenSerials="$SeenSerials|$DSerial|"
+					DH="$DH""1,$i,$DHealth,$DModel,$DSerial;"
+				fi
+			else # If initial read has failed, see if drives are behind hardware raid
+				DHealthA="$DHealth"
+				if [ "$MegaRaidChecked" -eq 0 ]
+				then
+					MegaRaidChecked=1
+					MegaRaid=()
+					while IFS='' read -r line; do MegaRaid+=("$line"); done < <(smartctl --scan | grep megaraid | awk '{print $1" "$3}')
+					if [ ${#MegaRaid[@]} -gt 0 ]
+					then
+						HardwareRaidPresent=1
+						MegaRaidN=0
+						for MegaRaidEntry in "${MegaRaid[@]}"
+						do
+							MegaRaidDev=${MegaRaidEntry%% *}
+							MegaRaidID=${MegaRaidEntry##* }
+							DHealth=$(smartctl -A -d "$MegaRaidID" "$MegaRaidDev")
+							if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -A -d $MegaRaidID $MegaRaidDev:\n$DHealth" >> "$ScriptPath"/debug.log; fi
+							if grep -q 'Attribute' <<< "$DHealth"
+							then
+								MegaRaidN=$((MegaRaidN + 1))
+								DHealth=$(smartctl -H -d "$MegaRaidID" "$MegaRaidDev")"\n$DHealth"
+								DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
+								DInfo="$(smartctl -i -d "$MegaRaidID" "$MegaRaidDev")"
+								DModel="$(echo "$DInfo" | grep -i "Device Model:" | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+								DSerial="$(echo "$DInfo" | grep -i "Serial Number:" | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+								if [ -z "$DSerial" ] || [[ "$SeenSerials" != *"|$DSerial|"* ]]
+								then
+									SeenSerials="$SeenSerials|$DSerial|"
+									DH="$DH""1,megaraid[$MegaRaidN],$DHealth,$DModel,$DSerial;"
+								fi
+							else
+								if grep -q 'START OF READ SMART DATA SECTION' <<< "$DHealth"
+								then
+									RaidHealthA="$DHealth"
+									DInfo="$(smartctl -i -d "$MegaRaidID" "$MegaRaidDev" 2>/dev/null)"
+									if grep -qi 'Transport protocol:.*SAS' <<< "$DInfo"
+									then
+										DSerial="$(echo "$DInfo" | grep -i "Serial Number:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+										if [ -z "$DSerial" ] || [[ "$SeenSerials" != *"|$DSerial|"* ]]
+										then
+											DHealthS="$(smartctl -H -l error -l ssd -d "$MegaRaidID" "$MegaRaidDev" 2>/dev/null | grep -E '^(SMART Health Status:|Percentage used endurance indicator:|Error counter log:|read:|write:|verify:|Non-medium error count:|Error Counter logging not supported)')"
+											if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -H -l error -l ssd -d $MegaRaidID $MegaRaidDev:\n$DHealthS" >> "$ScriptPath"/debug.log; fi
+											if grep -q 'SMART Health Status' <<< "$DHealthS"
+											then
+												SeenSerials="$SeenSerials|$DSerial|"
+												RaidSasN=$((RaidSasN + 1))
+												DRotation="$(echo "$DInfo" | grep -i "^Rotation Rate:" | head -n1)"
+												DHealth="$DHealthS\n$DRotation\n$RaidHealthA"
+												DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
+												DModel="$(echo "$DInfo" | grep -i "Vendor:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs) $(echo "$DInfo" | grep -i "Product:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+												DModel=$(echo "$DModel" | xargs)
+												DH="$DH""3,sas[$RaidSasN],$DHealth,$DModel,$DSerial;"
+											fi
+										fi
+									fi
+								fi
+							fi
+						done
+					fi
+				fi
+				if [ "$HPCCISSChecked" -eq 0 ]
+				then
+					HPCCISSChecked=1
+					HPCCISS=0
+					if lspci 2>/dev/null | grep -qi 'Smart Array'; then HPCCISS=1; fi
+					if lsmod 2>/dev/null | grep -qE '^hpsa|^cciss'; then HPCCISS=1; fi
+					if [ $HPCCISS -eq 1 ]
+					then
+						HardwareRaidPresent=1
+						CCISS_MAX=32
+						if command -v hpssacli >/dev/null 2>&1
+						then
+							CCISS_MAX=$(hpssacli ctrl all show config 2>/dev/null | grep -ci '^[[:space:]]*physicaldrive ')
+							if [ -z "$CCISS_MAX" ] || [ "$CCISS_MAX" -le 0 ]; then CCISS_MAX=32; fi
+						fi
+						CCISSN=0
+						IDX=0
+						while [ $IDX -lt $CCISS_MAX ]
+						do
+							DHealth=$(smartctl -A -d cciss,$IDX "$i" 2>/dev/null)
+							if grep -q 'Attribute' <<< "$DHealth"
+							then
+								CCISSN=$((CCISSN + 1))
+								DHealth=$(smartctl -H -d cciss,$IDX "$i")"\n$DHealth"
+								DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
+								DInfo="$(smartctl -i -d cciss,$IDX "$i")"
+								DModel="$(echo "$DInfo" | grep -i -E 'Device Model:|Model Number:' | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+								DSerial="$(echo "$DInfo" | grep -i 'Serial Number:' | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+								ii=${i##*/}
+								if [ -z "$DSerial" ] || [[ "$SeenSerials" != *"|$DSerial|"* ]]
+								then
+									SeenSerials="$SeenSerials|$DSerial|"
+									DH="$DH""1,${ii}[$CCISSN],$DHealth,$DModel,$DSerial;"
+								fi
+							else
+								if grep -q 'START OF READ SMART DATA SECTION' <<< "$DHealth"
+								then
+									RaidHealthA="$DHealth"
+									DInfo="$(smartctl -i -d cciss,$IDX "$i" 2>/dev/null)"
+									if grep -qi 'Transport protocol:.*SAS' <<< "$DInfo"
+									then
+										DSerial="$(echo "$DInfo" | grep -i "Serial Number:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+										if [ -z "$DSerial" ] || [[ "$SeenSerials" != *"|$DSerial|"* ]]
+										then
+											DHealthS="$(smartctl -H -l error -l ssd -d cciss,$IDX "$i" 2>/dev/null | grep -E '^(SMART Health Status:|Percentage used endurance indicator:|Error counter log:|read:|write:|verify:|Non-medium error count:|Error Counter logging not supported)')"
+											if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -H -l error -l ssd -d cciss,$IDX $i:\n$DHealthS" >> "$ScriptPath"/debug.log; fi
+											if grep -q 'SMART Health Status' <<< "$DHealthS"
+											then
+												SeenSerials="$SeenSerials|$DSerial|"
+												RaidSasN=$((RaidSasN + 1))
+												DRotation="$(echo "$DInfo" | grep -i "^Rotation Rate:" | head -n1)"
+												DHealth="$DHealthS\n$DRotation\n$RaidHealthA"
+												DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
+												DModel="$(echo "$DInfo" | grep -i "Vendor:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs) $(echo "$DInfo" | grep -i "Product:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+												DModel=$(echo "$DModel" | xargs)
+												DH="$DH""3,sas[$RaidSasN],$DHealth,$DModel,$DSerial;"
+											fi
+										fi
+									fi
+								fi
+							fi
+							IDX=$((IDX + 1))
+						done
+					fi
+				fi
+				DInfo="$(smartctl -i "$i" 2>/dev/null)"
+				HardwareRaidLogicalDevice=0
+				if [ "$HardwareRaidPresent" -eq 1 ] && grep -qiE '(^Vendor:[[:space:]]*(AVAGO|Broadcom|LSI|MegaRAID)([[:space:]]|$)|^(Product|Device Model):.*(PERC|MegaRAID|Smart Array|Logical Volume|Virtual Disk|ServeRAID|RAID|MR[0-9]|BOSS))' <<< "$DInfo"
+				then
+					HardwareRaidLogicalDevice=1
+				fi
+				if [ "$HardwareRaidLogicalDevice" -eq 0 ] && grep -qi 'Transport protocol:.*SAS' <<< "$DInfo"
+				then
+					DSerial="$(echo "$DInfo" | grep -i "Serial Number:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+					if [ -z "$DSerial" ] || [[ "$SeenSerials" != *"|$DSerial|"* ]]
+					then
+						DHealthS="$(smartctl -H -l error -l ssd "$i" 2>/dev/null | grep -E '^(SMART Health Status:|Percentage used endurance indicator:|Error counter log:|read:|write:|verify:|Non-medium error count:|Error Counter logging not supported)')"
+						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) smartctl -H -l error -l ssd $i:\n$DHealthS" >> "$ScriptPath"/debug.log; fi
+						if grep -q 'SMART Health Status' <<< "$DHealthS"
+						then
+							SeenSerials="$SeenSerials|$DSerial|"
+							DRotation="$(echo "$DInfo" | grep -i "^Rotation Rate:" | head -n1)"
+							DHealth="$DHealthS\n$DRotation\n$DHealthA"
+							DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
+							DModel="$(echo "$DInfo" | grep -i "Vendor:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs) $(echo "$DInfo" | grep -i "Product:" | head -n1 | awk -F ':' '{print $2}' | tr -d ',;' | xargs)"
+							DModel=$(echo "$DModel" | xargs)
+							i=${i##*/}
+							DH="$DH""3,$i,$DHealth,$DModel,$DSerial;"
+						fi
+					fi
+				fi
+			fi
+		done
+	fi
+	if [ -x "$(command -v nvme)" ] #Using nvme-cli (for NVMe)
+	then
+		NVMeList="$(nvme list)"
+		NVMeListJ="$(nvme list -o json)"
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) NVMe List:\n$NVMeList" >> "$ScriptPath"/debug.log; fi
+		for i in $(lsblk -lp | grep ' disk' | awk '{print $1}')
+		do
+			DHealth=$(nvme smart-log "$i" 2>/dev/null)
+			if grep -q 'NVME' <<< "$DHealth"
+			then
+				if [ -x "$(command -v smartctl)" ]
+				then
+					ii=${i##*/}
+					DHealth=$(smartctl -H /dev/"${ii%??}")"\n$DHealth"
+				fi
+				DHealth=$(echo -ne "$DHealth" | base64 | tr -d '\n\r\t ')
+				DeviceBlock=$(echo "$NVMeListJ" | awk -v RS='{' -v dev="$i" '$0 ~ dev')
+				DModel=$(echo "$DeviceBlock" | grep '"ModelNumber"' | sed -E 's/.*"ModelNumber"\s*:\s*"([^"]+)".*/\1/')
+				DSerial=$(echo "$DeviceBlock" | grep '"SerialNumber"' | sed -E 's/.*"SerialNumber"\s*:\s*"([^"]+)".*/\1/')
+				DFirmware=$(echo "$DeviceBlock" | grep '"Firmware"' | sed -E 's/.*"Firmware"\s*:\s*"([^"]+)".*/\1/')
+				if [ -z "$DModel" ]
+				then
+					MODELCOL=$(echo "$NVMeList" | grep "^Node" | tr -s ' ' | tr ' ' '\n' | grep -n -x "Model" | cut -d: -f1)
+					DModel="$(echo "$NVMeList" | grep "$i" | sed -E 's/[ ]{2,}/|/g' | awk -F '|' -v col="$MODELCOL" '{print $col}')"
+				else
+					if [ -n "$DFirmware" ]
+					then
+						DModel="$DModel - $DFirmware"
+					fi
+				fi
+				if [ -z "$DSerial" ]
+				then
+					SNCOL=$(echo "$NVMeList" | grep "^Node" | tr -s ' ' | tr ' ' '\n' | grep -n -x "SN" | cut -d: -f1)
+					DSerial="$(echo "$NVMeList" | grep "$i" | sed -E 's/[ ]{2,}/|/g' | awk -F '|' -v col="$SNCOL" '{print $col}')"
+				fi
+				DModel="$(echo "$DModel" | tr -d ',;' | xargs)"
+				DSerial="$(echo "$DSerial" | tr -d ',;' | xargs)"
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) NVMe $i Model: $DModel Serial: $DSerial" >> "$ScriptPath"/debug.log; fi
+				i=${i##*/}
+				DH="$DH""2,$i,$DHealth,$DModel,$DSerial;"
+			fi
+		done
+	fi
+fi
+DH=$(echo -ne "$DH" | base64 | tr -d '\n\r\t ')
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) DH: $DH" >> "$ScriptPath"/debug.log; fi
+
+# Custom Variables
+CV=""
+if [ -n "$CustomVars" ]
+then
+	CustomVarsPath=$(customvarspath "$CustomVars")
+	if [ -n "$CustomVarsPath" ] && [ -f "$CustomVarsPath" ] && [ -s "$CustomVarsPath" ]
+	then
+		CV=$(< "$CustomVarsPath" base64 | tr -d '\n\r\t ')
+	fi
+fi
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) CV: $CV" >> "$ScriptPath"/debug.log; fi
+
+# Outgoing PING
+OPING=""
+if [ -n "$OutgoingPings" ]
+then
+	OPING=$(grep -v '^$' "$ScriptPath"/ping.txt | tr -d '\n' | base64 | tr -d '\n\r\t ')
+	if [ -f "$ScriptPath"/ping.txt ]
+	then
+		rm -f "$ScriptPath"/ping.txt
+	fi
+fi
+
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) OPING: $OPING" >> "$ScriptPath"/debug.log; fi
+
+# Running Processes
+RPS1=""
+RPS2=""
+if [ "$RunningProcesses" -gt 0 ]
+then
+	if [ -f "$ScriptPath"/running_proc.txt ]
+	then
+		# Get initial 'running processes' snapshot, saved from last run
+		RPS1=$(cat "$ScriptPath"/running_proc.txt)
+	fi
+	# Get the current 'running processes' snapshot
+	RPS2=$(ps -Ao pid,ppid,uid,user:20,pcpu,pmem,cputime,etime,comm,cmd --no-headers)
+	RPS2=$(echo -ne "$RPS2" | base64 -w 0 | sed 's/ //g')
+	# Save the current snapshot for next run
+	echo "$RPS2" > "$ScriptPath"/running_proc.txt
+fi
+# Secured Connection
+if [ "$SecuredConnection" -gt 0 ]
+then
+	SecuredConnection=""
+else
+	SecuredConnection="--no-check-certificate"
+fi
+
+# Current time/date
+Time=$(date +%Y-%m-%d\ %T\ %Z | base64 | tr -d '\n\r\t ')
+
+# Prepare data
+json='{"version":"'"$Version"'","SID":"'"$SID"'","agent":"0","user":"'"$User"'","os":"'"$OS"'","kernel":"'"$Kernel"'","hostname":"'"$Hostname"'","time":"'"$Time"'","reqreboot":"'"$RequiresReboot"'","uptime":"'"$Uptime"'","cpumodel":"'"$CPUModel"'","cpusockets":"'"$CPUSockets"'","cpucores":"'"$CPUCores"'","cputhreads":"'"$CPUThreads"'","cpuspeed":"'"$CPUSpeed"'","cpu":"'"$CPU"'","wa":"'"$CPUwa"'","st":"'"$CPUst"'","us":"'"$CPUus"'","sy":"'"$CPUsy"'","load1":"'"$loadavg1"'","load5":"'"$loadavg5"'","load15":"'"$loadavg15"'","ramsize":"'"$RAMSize"'","ram":"'"$RAM"'","ramswapsize":"'"$RAMSwapSize"'","ramswap":"'"$RAMSwap"'","rambuff":"'"$RAMBuff"'","ramcache":"'"$RAMCache"'","disks":"'"$DISKs"'","inodes":"'"$INODEs"'","iops":"'"$IOPS"'","raid":"'"$RAID"'","zp":"'"$ZP"'","dh":"'"$DH"'","nics":"'"$NICS"'","ipv4":"'"$IPv4"'","ipv6":"'"$IPv6"'","conn":"'"$CONN"'","temp":"'"$TEMP"'","serv":"'"$SRVCS"'","cust":"'"$CV"'","oping":"'"$OPING"'","rps1":"'"$RPS1"'","rps2":"'"$RPS2"'"}'
+
+# Compress payload
+jsoncomp=$(echo -ne "$json" | gzip -cf | base64 -w 0 | sed 's/ //g' | sed 's/\//%2F/g' | sed 's/+/%2B/g')
+
+# Save data to file
+echo "j=$jsoncomp" > "$ScriptPath"/luma_agent.log
+
+if [ "$DEBUG" -eq 1 ]
+then
+	echo -e "$ScriptStartTime-$(date +%T]) JSON:\n$json" >> "$ScriptPath"/debug.log
+	# Post data
+	echo -e "$ScriptStartTime-$(date +%T]) Posting data" >> "$ScriptPath"/debug.log
+	wget -v --debug --retry-connrefused --waitretry=1 -t 3 -T 15 -O- --post-file="$ScriptPath/luma_agent.log" $SecuredConnection https://sm.luma.local/v2/ &>> "$ScriptPath"/debug.log 
+	echo -e "$ScriptStartTime-$(date +%T]) Data posted" >> "$ScriptPath"/debug.log
+else
+	# Post data
+	wget --retry-connrefused --waitretry=1 -t 3 -T 15 -qO- --post-file="$ScriptPath/luma_agent.log" $SecuredConnection https://sm.luma.local/v2/ &> /dev/null
+fi
+
+exit 0

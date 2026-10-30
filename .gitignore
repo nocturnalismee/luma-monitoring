@@ -1,0 +1,16 @@
+# LUMA agent — planning/process artifacts (not shipped)
+docs/
+
+# Runtime artifacts written by luma_agent.sh when run from the repo dir
+debug.log
+luma_cron.log
+luma_agent.log
+ping.txt
+running_proc.txt
+luma_reboot_check.cache
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
