@@ -10,10 +10,11 @@
   - Buat: struktur folder, `backend` (`go mod init github.com/nocturnalismee/luma-monitoring/backend`), `frontend` (Vite React TS), `Makefile` (target di `AGENT.md` bagian 6, termasuk `sync-agent`), `.gitignore` (termasuk `*.db`, `.env`, `backend/internal/agentdist/files/*` kecuali `README.txt`), `.editorconfig`, `.env.example`, CI GitHub Actions (lint + test backend dan frontend).
   - Terima: `make lint` dan `make test` berjalan hijau pada repo kosong; CI hijau.
 
-- [ ] **T-001 — Impor dan siapkan agent** · *T-000*
+- [x] **T-001 — Impor dan siapkan agent** · *T-000*
   - Refs: `DEPLOYMENT.md` 4.2, `DECISIONS.md` Q-001, `PROTOCOL.md` 6
   - Buat: salin kelima file agent ke `agent/`, jalankan perintah `sed` di `DEPLOYMENT.md` 4.2, tambah `agent/README.md` (asal file, perubahan yang dilakukan, versi 2.4.2).
   - Terima: `grep` tidak menemukan `sm.luma.local` maupun `raw.githubusercontent`; `bash -n` lolos untuk semua `.sh`; `git diff` terhadap file asli hanya berisi penggantian URL; pertanyaan Q-001 dicatat ke pengguna.
+  - Catatan penyelesaian (2026-11-14): kelima file sudah berada di `agent/` dari impor awal; `sed` bagian 4.2 dijalankan atas 9 literal URL (2 di `luma_agent.sh`, 4 di `luma_install.sh`, 2 di `luma_update.sh`, 1 di `luma_uninstall.sh`); `agent/README.md` diberi bagian "Provenance and repository notes". Prasyarat T-000 belum tercentang dan `make lint` / `make test` belum tersedia (`AGENT.md` 6) — lihat DECISIONS.md Q-008.
 
 - [ ] **T-002 — Konfigurasi, logging, server dasar** · *T-000*
   - Refs: `DEPLOYMENT.md` 1, `CONVENTIONS.md` 3

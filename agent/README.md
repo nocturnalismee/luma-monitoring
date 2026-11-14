@@ -1,5 +1,46 @@
 # LUMA - Lightweight Server Monitoring Agent
 
+
+## Provenance and repository notes (LUMA Monitoring)
+
+This directory holds the agent files used by the LUMA Monitoring backend. It is
+maintained as part of the `luma-monitoring` repository, not as an independent
+upstream project.
+
+- **Files in this directory** (`luma_agent.sh`, `luma.cfg`, `luma_install.sh`,
+  `luma_update.sh`, `luma_uninstall.sh`) are copied verbatim from the upstream
+  agent distribution, with the single exception listed under "Modifications".
+  This copy corresponds to **agent version 2.4.2**, declared at line 24 of
+  `luma_agent.sh` (`Version="2.4.2"`).
+- **Modifications**: only URL placeholders were introduced, exactly as specified
+  in `docs/DEPLOYMENT.md` section 4.2 (task `T-001`). No logic, payload format,
+  or behaviour was changed. Nine URL literals were replaced by the placeholder:
+  - host-based ingest/event URLs (2 places in `luma_agent.sh`, 1 place each in
+    `luma_install.sh` and `luma_uninstall.sh`)
+  - raw-source download URLs, including their repository/branch path segment
+    (3 places in `luma_install.sh`, 2 places in `luma_update.sh`)
+  The two literal strings that used to appear here are intentionally not repeated
+  in this file, so that the acceptance check for `T-001` (`grep` over `agent/`)
+  stays clean.
+  The backend replaces `__LUMA_BASE_URL__` with the configured `LUMA_BASE_URL`
+  when serving these files under `/agent/*` (see `docs/DEPLOYMENT.md` 4.1/4.3).
+  The `$BRANCH` argument parsed by the installer/updater no longer affects any
+  URL; it is retained for backwards compatibility only.
+- **Copyright / warranty headers** at the top of every script are kept unchanged.
+  Whether the upstream license permits modification, rebranding, and redistribution —
+  and whether attribution must be preserved — is still an open question tracked as
+  `Q-001` in `docs/DECISIONS.md`. Until that is answered, the interim default applies:
+  keep all existing copyright/disclaimer headers intact.
+- **Do not edit** these scripts beyond the placeholder changes above. Any further
+  change requires a task entry in `docs/TASKS.md` and an update to `docs/PROTOCOL.md`.
+- **Known cosmetic leftovers, deliberately untouched by `T-001`** (out of scope for a
+  URL-only change; fix them only via a new task): comments and user-facing strings still
+  refer to GitHub and to `$BRANCH` — `luma_install.sh:24`, `luma_install.sh:73`
+  ("Installing from $BRANCH branch..."), `luma_install.sh:185`, `luma_install.sh:194`,
+  `luma_update.sh:24`, `luma_update.sh:485`, `luma_update.sh:659`. The fetches now target
+  this backend under `/agent/*`, not GitHub, so those messages are misleading but harmless.
+
+
 Documentation available here: TODO
 
 ### Changelog

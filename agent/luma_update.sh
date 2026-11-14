@@ -480,7 +480,7 @@ STAGED_CONFIG="$CONFIG.update.$$"
 
 # Fetching the available agent to check its version
 echo "Checking available agent version..."
-if ! github_wget -t 1 -T 30 -qO "$NEW_AGENT" https://raw.githubusercontent.com/nocturnalismee/luma-monitoring/$BRANCH/agent/luma_agent.sh
+if ! github_wget -t 1 -T 30 -qO "$NEW_AGENT" __LUMA_BASE_URL__/agent/luma_agent.sh
 then
 	echo "ERROR: Failed to download the agent script from GitHub for branch/tag $BRANCH." >&2
 	exit 1
@@ -654,7 +654,7 @@ fi
 
 # Fetching the new config file
 echo "Fetching the new config file..."
-if ! github_wget -t 1 -T 30 -qO "$NEW_CONFIG" https://raw.githubusercontent.com/nocturnalismee/luma-monitoring/$BRANCH/agent/luma.cfg
+if ! github_wget -t 1 -T 30 -qO "$NEW_CONFIG" __LUMA_BASE_URL__/agent/luma.cfg
 then
 	echo "ERROR: Failed to download the agent configuration from GitHub." >&2
 	exit 1

@@ -2179,11 +2179,11 @@ then
 	echo -e "$ScriptStartTime-$(date +%T]) JSON:\n$json" >> "$ScriptPath"/debug.log
 	# Post data
 	echo -e "$ScriptStartTime-$(date +%T]) Posting data" >> "$ScriptPath"/debug.log
-	wget -v --debug --retry-connrefused --waitretry=1 -t 3 -T 15 -O- --post-file="$ScriptPath/luma_agent.log" $SecuredConnection https://sm.luma.local/v2/ &>> "$ScriptPath"/debug.log 
+	wget -v --debug --retry-connrefused --waitretry=1 -t 3 -T 15 -O- --post-file="$ScriptPath/luma_agent.log" $SecuredConnection __LUMA_BASE_URL__/v2/ &>> "$ScriptPath"/debug.log 
 	echo -e "$ScriptStartTime-$(date +%T]) Data posted" >> "$ScriptPath"/debug.log
 else
 	# Post data
-	wget --retry-connrefused --waitretry=1 -t 3 -T 15 -qO- --post-file="$ScriptPath/luma_agent.log" $SecuredConnection https://sm.luma.local/v2/ &> /dev/null
+	wget --retry-connrefused --waitretry=1 -t 3 -T 15 -qO- --post-file="$ScriptPath/luma_agent.log" $SecuredConnection __LUMA_BASE_URL__/v2/ &> /dev/null
 fi
 
 exit 0
