@@ -95,7 +95,7 @@ echo "... done."
 # Let luma platform know uninstall has been completed
 echo "Letting luma platform know the uninstallation has been completed..."
 POST="v=uninstall&s=$SID"
-wget -t 1 -T 30 -qO- --post-data "$POST" https://sm.luma.local/ &> /dev/null
+wget -t 1 -T 30 -qO- --post-data "$POST" __LUMA_BASE_URL__/ &> /dev/null
 echo "... done."
 
 # All done
