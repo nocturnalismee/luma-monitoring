@@ -11,26 +11,26 @@ import (
 
 // Config holds every runtime setting read from the environment at startup.
 type Config struct {
-	BaseURL     string        // LUMA_BASE_URL, no trailing slash
-	SecretKey   []byte        // LUMA_SECRET_KEY, exactly 32 raw bytes
-	DBPath      string        // LUMA_DB_PATH
-	Listen      string        // LUMA_LISTEN
-	TrustedProxies []string   // LUMA_TRUSTED_PROXIES, comma-separated CIDRs
-	IngestMaxBody int64       // LUMA_INGEST_MAX_BODY
-	IngestMaxDecompressed int64 // LUMA_INGEST_MAX_DECOMPRESSED
-	SessionTTL  time.Duration // LUMA_SESSION_TTL
-	LogLevel    string        // LUMA_LOG_LEVEL
+	BaseURL               string        // LUMA_BASE_URL, no trailing slash
+	SecretKey             []byte        // LUMA_SECRET_KEY, exactly 32 raw bytes
+	DBPath                string        // LUMA_DB_PATH
+	Listen                string        // LUMA_LISTEN
+	TrustedProxies        []string      // LUMA_TRUSTED_PROXIES, comma-separated CIDRs
+	IngestMaxBody         int64         // LUMA_INGEST_MAX_BODY
+	IngestMaxDecompressed int64         // LUMA_INGEST_MAX_DECOMPRESSED
+	SessionTTL            time.Duration // LUMA_SESSION_TTL
+	LogLevel              string        // LUMA_LOG_LEVEL
 }
 
 // Load reads the environment described by DEPLOYMENT.md section 1 and returns a
 // validated Config. It never includes secret values in its error messages.
 func Load(env map[string]string) (*Config, error) {
 	cfg := &Config{
-		DBPath:              valueOr(env, "LUMA_DB_PATH", "/data/luma.db"),
-		Listen:              valueOr(env, "LUMA_LISTEN", ":8080"),
-		IngestMaxBody:       defaultInt64(valueOr(env, "LUMA_INGEST_MAX_BODY", "5242880")),
+		DBPath:                valueOr(env, "LUMA_DB_PATH", "/data/luma.db"),
+		Listen:                valueOr(env, "LUMA_LISTEN", ":8080"),
+		IngestMaxBody:         defaultInt64(valueOr(env, "LUMA_INGEST_MAX_BODY", "5242880")),
 		IngestMaxDecompressed: defaultInt64(valueOr(env, "LUMA_INGEST_MAX_DECOMPRESSED", "20971520")),
-		LogLevel:            strings.ToLower(valueOr(env, "LUMA_LOG_LEVEL", "info")),
+		LogLevel:              strings.ToLower(valueOr(env, "LUMA_LOG_LEVEL", "info")),
 	}
 
 	base, err := parseBaseURL(env["LUMA_BASE_URL"])
@@ -39,7 +39,7 @@ func Load(env map[string]string) (*Config, error) {
 	}
 	cfg.BaseURL = base
 
-	key, err := parseSecretKey(env["LUMA_SECRET_KEY"])
+	key, err := parseSecretKey(strings.TrimSpace(env["LUMA_SECRET_KEY"]))
 	if err != nil {
 		return nil, err
 	}
@@ -96,4 +96,19 @@ func parseSecretKey(raw string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid LUMA_SECRET_KEY: must decode to 32 bytes, got %d", len(key))
 	}
 	return key, nil
+}
+
+// LoadFromEnv reads configuration through the given lookup function
+// (os.Getenv in production, a fake in tests).
+func LoadFromEnv(getenv func(string) string) (*Config, error) {
+	keys := []string{
+		"LUMA_BASE_URL", "LUMA_SECRET_KEY", "LUMA_DB_PATH", "LUMA_LISTEN",
+		"LUMA_TRUSTED_PROXIES", "LUMA_INGEST_MAX_BODY",
+		"LUMA_INGEST_MAX_DECOMPRESSED", "LUMA_SESSION_TTL", "LUMA_LOG_LEVEL",
+	}
+	env := make(map[string]string, len(keys))
+	for _, k := range keys {
+		env[k] = getenv(k)
+	}
+	return Load(env)
 }

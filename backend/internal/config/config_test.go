@@ -8,7 +8,7 @@ import (
 // validEnv returns the minimal set of required variables with valid values.
 func validEnv() map[string]string {
 	return map[string]string{
-		"LUMA_BASE_URL":   "https://monitor.example.com",
+		"LUMA_BASE_URL": "https://monitor.example.com",
 		// 32 random bytes, base64. Test-only fixture value, never a real secret.
 		"LUMA_SECRET_KEY": "tVf1l52i+8oAixhMMr/Z6c49hWVF8JdWRwHvZuVYoN4=",
 	}
@@ -69,8 +69,9 @@ func TestLoadErrors(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.wantSub) {
 				t.Errorf("error %q does not mention %q", err, tc.wantSub)
 			}
-			// Errors must never echo secret values back.
-			if strings.Contains(err.Error(), env["LUMA_SECRET_KEY"]) {
+			// Errors must never echo secret values back. (An empty
+			// variable value is a name, not a secret; skip that case.)
+			if v := env["LUMA_SECRET_KEY"]; v != "" && strings.Contains(err.Error(), v) {
 				t.Errorf("error leaks secret value: %v", err)
 			}
 		})
@@ -79,7 +80,9 @@ func TestLoadErrors(t *testing.T) {
 
 func TestSecretErrorDoesNotLeakValue(t *testing.T) {
 	env := validEnv()
-	env["LUMA_SECRET_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" // 33 bytes
+	// 45 'A' chars decode to 33 raw bytes (a padded 44-char base64 string can
+	// only encode up to 32/33 bytes depending on padding; 44 A's + '=' is 32).
+	env["LUMA_SECRET_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" // 33 bytes
 	_, err := Load(env)
 	if err == nil {
 		t.Fatal("expected error for 33-byte key")
