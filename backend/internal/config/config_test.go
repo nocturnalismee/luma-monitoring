@@ -80,7 +80,9 @@ func TestLoadErrors(t *testing.T) {
 
 func TestSecretErrorDoesNotLeakValue(t *testing.T) {
 	env := validEnv()
-	env["LUMA_SECRET_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" // 33 bytes
+	// 45 'A' chars decode to 33 raw bytes (a padded 44-char base64 string can
+	// only encode up to 32/33 bytes depending on padding; 44 A's + '=' is 32).
+	env["LUMA_SECRET_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" // 33 bytes
 	_, err := Load(env)
 	if err == nil {
 		t.Fatal("expected error for 33-byte key")

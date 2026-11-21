@@ -6,12 +6,11 @@ import (
 	"strings"
 )
 
-// base64Decode accepts standard and URL-safe base64 with or without padding.
+// base64Decode decodes strictly standard base64 (with padding). It must not
+// fall back to RawStdEncoding: raw decoding of a padded-but-invalid string
+// can silently produce wrong-length keys (e.g. 33 bytes instead of an error).
 func base64Decode(s string) ([]byte, error) {
-	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
-		return b, nil
-	}
-	return base64.RawStdEncoding.DecodeString(s)
+	return base64.StdEncoding.DecodeString(s)
 }
 
 func valueOr(env map[string]string, key, def string) string {
